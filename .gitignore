@@ -1,0 +1,37 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual env
+venv/
+env/
+.venv/
+conda-env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Model / checkpoint
+ckpt/
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.pkl
+
+# Data
+data/
+*.csv
+
+# Output / results
+results/
+outputs/
+*.xlsx
+
+# OS
+.DS_Store
+Thumbs.db
