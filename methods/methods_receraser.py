@@ -16,6 +16,12 @@ class RecEraserMethod:
     - aggregation training after locals
     - optional cache, but easy to disable
     - unlearning retrains only affected shards, then retrains agg
+
+    Important fixes in this version:
+    - every unlearning run starts from the ORIGINAL partitioned data
+    - every unlearning run restores the ORIGINAL initial-trained model state
+    - unlearning does NOT overwrite the saved initial state
+      (so repeated runs stay independent, like paper-style experiments)
     """
 
     def __init__(self, cfg, loader, model):
@@ -40,14 +46,17 @@ class RecEraserMethod:
         self.partition_type = getattr(cfg, "partition_type", "user_based")
         self.final_model = self.base_model
 
-        self.original_C = copy.deepcopy(loader.C)
-        self.original_C_U = copy.deepcopy(loader.C_U)
-        self.original_C_I = copy.deepcopy(loader.C_I)
+        # snapshot ORIGINAL partition / train data right after loader construction
+        self.original_C = copy.deepcopy(getattr(loader, "C", None))
+        self.original_C_U = copy.deepcopy(getattr(loader, "C_U", None))
+        self.original_C_I = copy.deepcopy(getattr(loader, "C_I", None))
+        self.original_n_C = copy.deepcopy(getattr(loader, "n_C", []))
 
         self.original_train_user_dict = copy.deepcopy(loader.train_user_dict)
         self.original_exist_users = copy.deepcopy(loader.exist_users)
         self.original_n_train = loader.n_train
 
+        # keep immutable baseline after initial_train()
         self.initial_model_state = None
 
     # =========================================================
@@ -110,6 +119,7 @@ class RecEraserMethod:
 
         self.base_model.set_state(model_state)
         self.final_model = self.base_model
+        self.initial_model_state = copy.deepcopy(model_state)
         self._init_cache_loaded = True
 
         print(f"[RecEraser Init Cache] Loaded from {path}")
@@ -119,15 +129,31 @@ class RecEraserMethod:
     # INTERNAL
     # =========================================================
     def _reset_loader_to_original_partition(self):
+        # Prefer the loader's own reset path when available
+        if hasattr(self.loader, "reset_all_train_state"):
+            self.loader.reset_all_train_state()
+            return
+
+        if hasattr(self.loader, "reset_partition_state"):
+            self.loader.reset_partition_state()
+            return
+
+        if hasattr(self.loader, "reset_global_train_data"):
+            self.loader.reset_global_train_data()
+
+        # Fallback manual restore for rec metadata
         self.loader.C = copy.deepcopy(self.original_C)
         self.loader.C_U = copy.deepcopy(self.original_C_U)
         self.loader.C_I = copy.deepcopy(self.original_C_I)
+        if hasattr(self.loader, "n_C"):
+            self.loader.n_C = copy.deepcopy(self.original_n_C)
 
         self.loader.train_user_dict = copy.deepcopy(self.original_train_user_dict)
         self.loader.exist_users = copy.deepcopy(self.original_exist_users)
         self.loader.n_train = self.original_n_train
 
-        self.loader._rebuild_rec_metadata()
+        if hasattr(self.loader, "_rebuild_rec_metadata"):
+            self.loader._rebuild_rec_metadata()
 
     def _restore_initial_model_state(self):
         if self.initial_model_state is None:
@@ -221,7 +247,6 @@ class RecEraserMethod:
         local_epochs = getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1))
         agg_epochs = getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1))
 
-        # local train
         for sid in range(len(self.loader.C)):
             print(f"\n[REC TRAIN] shard={sid}")
             print(f"  partition_type={self.partition_type}")
@@ -243,7 +268,6 @@ class RecEraserMethod:
 
         local_total = sum(shard_times.values())
 
-        # agg train
         agg_start = time.time()
         agg_stats = self.base_model.fit_agg(
             loader=self.loader,
@@ -286,10 +310,13 @@ class RecEraserMethod:
             users_to_remove, items_to_remove, interactions_to_remove
         )
 
-        # self._reset_loader_to_original_partition()
+        # IMPORTANT: make every run independent.
+        self._reset_loader_to_original_partition()
         self._restore_initial_model_state()
+
         start = time.time()
         shard_train_time = {}
+        original_total_interactions = self.loader.n_train
 
         affected, affected_breakdown = self._find_affected_shards_union(
             users_to_remove, items_to_remove, interactions_to_remove
@@ -349,7 +376,6 @@ class RecEraserMethod:
             getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1)),
         )
 
-        # local retrain
         for sid in affected:
             print(f"\n[REC RETRAIN] shard={sid}")
             print(f"  partition_type={self.partition_type}")
@@ -371,7 +397,6 @@ class RecEraserMethod:
 
         affected_shard_time = sum(shard_train_time.values())
 
-        # agg retrain
         agg_time = 0.0
         if getattr(self.cfg, "run_agg_after_unlearn", True):
             agg_start = time.time()
@@ -390,14 +415,14 @@ class RecEraserMethod:
             print("[REC UNLEARN] Skip aggregation after unlearning")
 
         self.final_model = self.base_model
-        if hasattr(self.base_model, "get_state"):
-            self.initial_model_state = copy.deepcopy(self.base_model.get_state())
+        # DO NOT overwrite self.initial_model_state here.
+        # Keeping the original initial state is critical for independent runs.
         self._maybe_save_pretrain()
 
         retrain_time = affected_shard_time + agg_time
         retrain_ratio = (
-            float(total_retrain_interactions) / float(self.loader.n_train)
-            if self.loader.n_train > 0 else 0.0
+            float(total_retrain_interactions) / float(original_total_interactions)
+            if original_total_interactions > 0 else 0.0
         )
         sec_per_retrain_interaction = (
             retrain_time / total_retrain_interactions

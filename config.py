@@ -10,7 +10,7 @@ class Config:
         # =========================
         # dataset / paths
         # =========================
-        self.dataset_name = "yelp2018"
+        self.dataset_name = "yelp2018"   # ml-1m | ml-10m|yelp2018
         self.train_path = "data/yelp2018/train.txt"
         self.test_path = "data/yelp2018/test.txt"
 
@@ -26,8 +26,8 @@ class Config:
         self.gcn_layers = 3
         self.lr = 0.001
         self.epochs = 5
-        self.local_epochs = 3
-        self.batch_size = 512
+        self.local_epochs = 1
+        self.batch_size = 1024
         self.reg_lambda = 1e-4
         self.dropout = 0.7
         self.print_loss = True
@@ -51,7 +51,7 @@ class Config:
         # unlearning
         # =========================
         self.unlearn_type = "user"   # user | interaction | item
-        self.unlearn_eval_runs = 5
+        self.unlearn_eval_runs = 1
         self.unlearn_seed = 2024
 
         self.unlearn_user_count = 1
@@ -69,11 +69,11 @@ class Config:
         # =========================
         # RecEraser aggregation
         # =========================
-        self.epoch_agg = 3
+        self.epoch_agg = 1
         self.agg_epochs = self.epoch_agg
-        self.unlearn_agg_epochs = 2
+        self.unlearn_agg_epochs = 1
         self.run_agg_after_unlearn = True
-        self.agg_sample_ratio = 0.1
+        self.agg_sample_ratio = 1
 
         # =========================
         # cache

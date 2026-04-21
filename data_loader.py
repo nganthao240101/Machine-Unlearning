@@ -1,3 +1,4 @@
+
 import copy
 import os
 import random
@@ -18,13 +19,13 @@ class DataLoader:
         self.test_path = cfg.test_path
         self.method = getattr(cfg, "method", getattr(cfg, "method_type", "sisa"))
         self.partition_type = getattr(cfg, "partition_type", "user_based")
-        self.shard_num = getattr(cfg, "shard_num", 3)
-        self.slice_num = getattr(cfg, "slice_num", 3)
-        self.seed = getattr(cfg, "seed", 2024)
-        self.batch_size = getattr(cfg, "batch_size", 256)
+        self.shard_num = int(getattr(cfg, "shard_num", 3))
+        self.slice_num = int(getattr(cfg, "slice_num", 3))
+        self.seed = int(getattr(cfg, "seed", 2024))
+        self.batch_size = int(getattr(cfg, "batch_size", 256))
 
-        random.seed(self.seed)
-        np.random.seed(self.seed)
+        self.py_rng = random.Random(self.seed)
+        self.np_rng = np.random.RandomState(self.seed)
 
         self.train_user_dict = {}
         self.test_user_dict = {}
@@ -52,9 +53,22 @@ class DataLoader:
         self.n_train = 0
         self.n_test = 0
 
+        # global backup
         self._original_train_user_dict = None
         self._original_exist_users = None
         self._original_n_train = None
+
+        # rec backup
+        self._original_C = None
+        self._original_C_U = None
+        self._original_C_I = None
+        self._original_shards = None
+        self._original_shard_data = None
+        self._original_unlearned_shard_data = None
+        self._original_user_to_shards = None
+        self._original_community_to_user = None
+        self._original_community_to_item = None
+        self._original_n_C = None
 
         # adjacency cache for LightGCN
         self._global_adj_cache = None
@@ -73,6 +87,7 @@ class DataLoader:
             self.shards = self._build_shards()
 
         self._backup_original_train_state()
+        self._backup_original_partition_state()
 
     # =========================================================
     # cache
@@ -233,12 +248,41 @@ class DataLoader:
         self._original_exist_users = copy.deepcopy(self.exist_users)
         self._original_n_train = self.n_train
 
+    def _backup_original_partition_state(self):
+        self._original_C = copy.deepcopy(self.C)
+        self._original_C_U = copy.deepcopy(self.C_U)
+        self._original_C_I = copy.deepcopy(self.C_I)
+        self._original_shards = copy.deepcopy(self.shards)
+        self._original_shard_data = copy.deepcopy(self.shard_data)
+        self._original_unlearned_shard_data = copy.deepcopy(self.unlearned_shard_data)
+        self._original_user_to_shards = copy.deepcopy(self.user_to_shards)
+        self._original_community_to_user = copy.deepcopy(self.community_to_user)
+        self._original_community_to_item = copy.deepcopy(self.community_to_item)
+        self._original_n_C = copy.deepcopy(self.n_C)
+
     def reset_global_train_data(self):
         if self._original_train_user_dict is not None:
             self.train_user_dict = copy.deepcopy(self._original_train_user_dict)
             self.exist_users = copy.deepcopy(self._original_exist_users)
             self.n_train = self._original_n_train
             self._invalidate_adj_cache()
+
+    def reset_partition_state(self):
+        self.C = copy.deepcopy(self._original_C)
+        self.C_U = copy.deepcopy(self._original_C_U)
+        self.C_I = copy.deepcopy(self._original_C_I)
+        self.shards = copy.deepcopy(self._original_shards)
+        self.shard_data = copy.deepcopy(self._original_shard_data)
+        self.unlearned_shard_data = copy.deepcopy(self._original_unlearned_shard_data)
+        self.user_to_shards = copy.deepcopy(self._original_user_to_shards)
+        self.community_to_user = copy.deepcopy(self._original_community_to_user)
+        self.community_to_item = copy.deepcopy(self._original_community_to_item)
+        self.n_C = copy.deepcopy(self._original_n_C)
+        self.reset_global_train_data()
+        self._invalidate_adj_cache()
+
+    def reset_all_train_state(self):
+        self.reset_partition_state()
 
     # =========================================================
     # helpers
@@ -352,12 +396,9 @@ class DataLoader:
     def _build_sisa_random_shards(self):
         """
         Interaction-based random shards for SISA.
-
         Each interaction is assigned directly to a random shard.
-        This makes one user likely to appear in multiple shards.
         """
         rng = random.Random(self.seed)
-
         interactions = self._flatten_interactions(self.train_user_dict)
         rng.shuffle(interactions)
 
@@ -395,11 +436,7 @@ class DataLoader:
 
         slices = []
         for slice_id in range(self.slice_num):
-            if slice_id == self.slice_num - 1:
-                upto = total
-            else:
-                upto = min(total, (slice_id + 1) * slice_size)
-
+            upto = total if slice_id == self.slice_num - 1 else min(total, (slice_id + 1) * slice_size)
             cumulative_part = interactions[:upto]
             slice_user_dict = self._build_user_dict_from_interactions(cumulative_part)
             slices.append(slice_user_dict)
@@ -537,9 +574,9 @@ class DataLoader:
             )
 
         if self.batch_size <= len(valid_users):
-            users = random.sample(valid_users, self.batch_size)
+            users = self.py_rng.sample(valid_users, self.batch_size)
         else:
-            users = [random.choice(valid_users) for _ in range(self.batch_size)]
+            users = [self.py_rng.choice(valid_users) for _ in range(self.batch_size)]
 
         def sample_pos_items_for_u(u, num):
             pos_items = self.C[local].get(u, [])
@@ -548,7 +585,7 @@ class DataLoader:
 
             pos_batch = []
             while len(pos_batch) < num:
-                pos_i_id = random.choice(pos_items)
+                pos_i_id = self.py_rng.choice(pos_items)
                 if pos_i_id not in pos_batch:
                     pos_batch.append(pos_i_id)
             return pos_batch
@@ -563,12 +600,15 @@ class DataLoader:
 
                 while len(neg_items) < num and guard < max_guard:
                     guard += 1
-                    neg_i_id = random.choice(can_items)
+                    neg_i_id = self.py_rng.choice(can_items)
                     if neg_i_id not in self.train_user_dict.get(u, []) and neg_i_id not in neg_items:
                         neg_items.append(neg_i_id)
 
-            while len(neg_items) < num:
-                neg_i_id = random.randint(0, self.n_items - 1)
+            guard = 0
+            max_guard = max(100, self.n_items * 2)
+            while len(neg_items) < num and guard < max_guard:
+                guard += 1
+                neg_i_id = self.py_rng.randint(0, self.n_items - 1)
                 if neg_i_id not in self.train_user_dict.get(u, []) and neg_i_id not in neg_items:
                     neg_items.append(int(neg_i_id))
 
@@ -604,9 +644,9 @@ class DataLoader:
             )
 
         if self.batch_size <= len(valid_users):
-            users = random.sample(valid_users, self.batch_size)
+            users = self.py_rng.sample(valid_users, self.batch_size)
         else:
-            users = [random.choice(valid_users) for _ in range(self.batch_size)]
+            users = [self.py_rng.choice(valid_users) for _ in range(self.batch_size)]
 
         def sample_pos_items_for_u(u, num):
             pos_items = self.train_user_dict.get(u, [])
@@ -615,7 +655,7 @@ class DataLoader:
 
             pos_batch = []
             while len(pos_batch) < num:
-                pos_i_id = random.choice(pos_items)
+                pos_i_id = self.py_rng.choice(pos_items)
                 if pos_i_id not in pos_batch:
                     pos_batch.append(pos_i_id)
             return pos_batch
@@ -627,7 +667,7 @@ class DataLoader:
 
             while len(neg_items) < num and guard < max_guard:
                 guard += 1
-                neg_id = random.randint(0, self.n_items - 1)
+                neg_id = self.py_rng.randint(0, self.n_items - 1)
                 if neg_id not in self.train_user_dict.get(u, []) and neg_id not in neg_items:
                     neg_items.append(int(neg_id))
 
