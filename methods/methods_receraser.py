@@ -1,7 +1,7 @@
 import copy
+import time
 import os
 import pickle as pkl
-import time
 
 from methods.methods_common import (
     save_pretrain_embeddings,
@@ -11,17 +11,10 @@ from methods.methods_common import (
 
 class RecEraserMethod:
     """
-    RecEraser flow closer to the reference code:
-    - local training over every shard
-    - aggregation training after locals
-    - optional cache, but easy to disable
-    - unlearning retrains only affected shards, then retrains agg
-
-    Important fixes in this version:
-    - every unlearning run starts from the ORIGINAL partitioned data
-    - every unlearning run restores the ORIGINAL initial-trained model state
-    - unlearning does NOT overwrite the saved initial state
-      (so repeated runs stay independent, like paper-style experiments)
+    RecEraser:
+    - initial train: local shard training + global aggregation
+    - unlearn: reset original state, remove targets, retrain affected shards only,
+      then aggregate on all remaining data
     """
 
     def __init__(self, cfg, loader, model):
@@ -46,17 +39,15 @@ class RecEraserMethod:
         self.partition_type = getattr(cfg, "partition_type", "user_based")
         self.final_model = self.base_model
 
-        # snapshot ORIGINAL partition / train data right after loader construction
-        self.original_C = copy.deepcopy(getattr(loader, "C", None))
-        self.original_C_U = copy.deepcopy(getattr(loader, "C_U", None))
-        self.original_C_I = copy.deepcopy(getattr(loader, "C_I", None))
+        self.original_C = copy.deepcopy(loader.C)
+        self.original_C_U = copy.deepcopy(loader.C_U)
+        self.original_C_I = copy.deepcopy(loader.C_I)
         self.original_n_C = copy.deepcopy(getattr(loader, "n_C", []))
 
         self.original_train_user_dict = copy.deepcopy(loader.train_user_dict)
         self.original_exist_users = copy.deepcopy(loader.exist_users)
-        self.original_n_train = loader.n_train
+        self.original_n_train = int(loader.n_train)
 
-        # keep immutable baseline after initial_train()
         self.initial_model_state = None
 
     # =========================================================
@@ -76,7 +67,10 @@ class RecEraserMethod:
         shard_num = getattr(self.cfg, "shard_num", 5)
         seed = getattr(self.cfg, "seed", 2024)
 
-        fname = f"{dataset}__{model_type}__{partition_type}__shard{shard_num}__seed{seed}.pkl"
+        fname = (
+            f"{dataset}__{model_type}__{partition_type}"
+            f"__shard{shard_num}__seed{seed}.pkl"
+        )
         return os.path.join(cache_dir, fname)
 
     def _save_init_cache(self, init_stats):
@@ -118,6 +112,10 @@ class RecEraserMethod:
             return None
 
         self.base_model.set_state(model_state)
+
+        # if hasattr(self.base_model, "set_loader"):
+        #     self.base_model.set_loader(self.loader)
+
         self.final_model = self.base_model
         self.initial_model_state = copy.deepcopy(model_state)
         self._init_cache_loaded = True
@@ -129,19 +127,6 @@ class RecEraserMethod:
     # INTERNAL
     # =========================================================
     def _reset_loader_to_original_partition(self):
-        # Prefer the loader's own reset path when available
-        if hasattr(self.loader, "reset_all_train_state"):
-            self.loader.reset_all_train_state()
-            return
-
-        if hasattr(self.loader, "reset_partition_state"):
-            self.loader.reset_partition_state()
-            return
-
-        if hasattr(self.loader, "reset_global_train_data"):
-            self.loader.reset_global_train_data()
-
-        # Fallback manual restore for rec metadata
         self.loader.C = copy.deepcopy(self.original_C)
         self.loader.C_U = copy.deepcopy(self.original_C_U)
         self.loader.C_I = copy.deepcopy(self.original_C_I)
@@ -150,7 +135,7 @@ class RecEraserMethod:
 
         self.loader.train_user_dict = copy.deepcopy(self.original_train_user_dict)
         self.loader.exist_users = copy.deepcopy(self.original_exist_users)
-        self.loader.n_train = self.original_n_train
+        self.loader.n_train = int(self.original_n_train)
 
         if hasattr(self.loader, "_rebuild_rec_metadata"):
             self.loader._rebuild_rec_metadata()
@@ -163,10 +148,34 @@ class RecEraserMethod:
         self.base_model.set_state(copy.deepcopy(self.initial_model_state))
         self.final_model = self.base_model
 
+    def _rebuild_global_remaining_data(self):
+        if hasattr(self.loader, "rebuild_global_train_from_shards"):
+            self.loader.rebuild_global_train_from_shards()
+            return
+
+        merged = {}
+        for shard_dict in self.loader.C:
+            if shard_dict is None:
+                continue
+            for u, items in shard_dict.items():
+                if not items:
+                    continue
+                if u not in merged:
+                    merged[u] = set()
+                merged[u].update(items)
+
+        self.loader.train_user_dict = {
+            u: sorted(list(items)) for u, items in merged.items() if len(items) > 0
+        }
+        self.loader.exist_users = sorted(self.loader.train_user_dict.keys())
+        self.loader.n_train = sum(len(items) for items in self.loader.train_user_dict.values())
+
+        if hasattr(self.loader, "_invalidate_adj_cache"):
+            self.loader._invalidate_adj_cache()
+
     def _maybe_save_pretrain(self):
         if self.final_model is None:
             return
-
         if not getattr(self.cfg, "save_pretrain", False):
             return
 
@@ -183,13 +192,21 @@ class RecEraserMethod:
     def _normalize_unlearn_inputs(self, users_to_remove=None, items_to_remove=None, interactions_to_remove=None):
         users_to_remove = sorted(set(users_to_remove or []))
         items_to_remove = sorted(set(items_to_remove or []))
-        interactions_to_remove = sorted(set((int(u), int(i)) for u, i in (interactions_to_remove or [])))
+        interactions_to_remove = sorted(
+            set((int(u), int(i)) for u, i in (interactions_to_remove or []))
+        )
         return users_to_remove, items_to_remove, interactions_to_remove
 
     def _find_affected_shards_union(self, users_to_remove, items_to_remove, interactions_to_remove):
-        affected_users = self.loader.find_affected_shards(users_to_remove) if users_to_remove else []
-        affected_items = self.loader.find_affected_shards_by_items(items_to_remove) if items_to_remove else []
-        affected_interactions = self.loader.find_affected_shards_by_interactions(interactions_to_remove) if interactions_to_remove else []
+        affected_users = (
+            self.loader.find_affected_shards(users_to_remove) if users_to_remove else []
+        )
+        affected_items = (
+            self.loader.find_affected_shards_by_items(items_to_remove) if items_to_remove else []
+        )
+        affected_interactions = (
+            self.loader.find_affected_shards_by_interactions(interactions_to_remove) if interactions_to_remove else []
+        )
 
         affected = sorted(list(set(affected_users) | set(affected_items) | set(affected_interactions)))
         return affected, {
@@ -219,7 +236,12 @@ class RecEraserMethod:
             total_retrain_items += n_items
             total_retrain_interactions += n_interactions
 
-        return retrain_shard_stats, total_retrain_users, total_retrain_items, total_retrain_interactions
+        return (
+            retrain_shard_stats,
+            total_retrain_users,
+            total_retrain_items,
+            total_retrain_interactions,
+        )
 
     # =========================================================
     # INITIAL TRAIN
@@ -233,59 +255,39 @@ class RecEraserMethod:
             print("[RecEraser] Skip initial training because cached state is available")
             return cached_stats
 
-        if hasattr(self.loader, "print_shard_summary"):
-            self.loader.print_shard_summary()
-
         init_start = time.time()
         shard_times = {}
 
-        print("\n[GLOBAL TRAIN SIZE]")
-        print(f"  total_users        : {len(self.loader.exist_users)}")
-        print(f"  total_items        : {len(self.loader.items)}")
-        print(f"  total_interactions : {self.loader.n_train}")
-
-        local_epochs = getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1))
-        agg_epochs = getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1))
-
         for sid in range(len(self.loader.C)):
             print(f"\n[REC TRAIN] shard={sid}")
-            print(f"  partition_type={self.partition_type}")
             print(f"  users={len(self.loader.C_U[sid])}")
             print(f"  items={len(self.loader.C_I[sid])}")
             print(f"  interactions={self.loader.n_C[sid]}")
 
             t0 = time.time()
-            local_stats = self.base_model.fit_local(
+            self.base_model.fit_local(
                 loader=self.loader,
                 local_id=sid,
-                epochs=local_epochs,
+                epochs=getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1)),
             )
             shard_times[sid] = time.time() - t0
 
-            print(f"  shard_train_time={shard_times[sid]:.4f}s")
-            if local_stats is not None:
-                print(f"  local_last_stats={local_stats}")
-
-        local_total = sum(shard_times.values())
+        self._rebuild_global_remaining_data()
 
         agg_start = time.time()
-        agg_stats = self.base_model.fit_agg(
+        self.base_model.fit_agg(
             loader=self.loader,
-            epochs=agg_epochs,
+            epochs=getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1)),
         )
         agg_time = time.time() - agg_start
-
-        print("\n[REC AGG TRAIN]")
-        print(f"  agg_epochs={agg_epochs}")
-        print(f"  agg_train_time={agg_time:.4f}s")
-        if agg_stats is not None:
-            print(f"  agg_last_stats={agg_stats}")
 
         self.final_model = self.base_model
         if hasattr(self.base_model, "get_state"):
             self.initial_model_state = copy.deepcopy(self.base_model.get_state())
+
         self._maybe_save_pretrain()
 
+        local_total = sum(shard_times.values())
         init_stats = {
             "status": "initial_train_done",
             "partition_type": self.partition_type,
@@ -310,25 +312,20 @@ class RecEraserMethod:
             users_to_remove, items_to_remove, interactions_to_remove
         )
 
-        # IMPORTANT: make every run independent.
         self._reset_loader_to_original_partition()
         self._restore_initial_model_state()
 
         start = time.time()
         shard_train_time = {}
-        original_total_interactions = self.loader.n_train
+        original_total_interactions = int(self.loader.n_train)
 
         affected, affected_breakdown = self._find_affected_shards_union(
             users_to_remove, items_to_remove, interactions_to_remove
         )
 
-        print(f"[REC UNLEARN] affected_users={users_to_remove}")
-        print(f"[REC UNLEARN] affected_items={items_to_remove}")
-        print(f"[REC UNLEARN] affected_interactions={interactions_to_remove}")
         print(f"[REC UNLEARN] affected_shards={affected}")
 
         if len(affected) == 0:
-            print("[REC UNLEARN] No affected shard -> skip local retraining and aggregation.")
             return self.final_model, {
                 "status": "unlearn_done",
                 "partition_type": self.partition_type,
@@ -353,77 +350,74 @@ class RecEraserMethod:
                 "total_time": time.time() - start,
             }
 
+        before_remove = int(self.loader.n_train)
+
+        removed_shards_user = []
+        removed_shards_item = []
+        removed_shards_inter = []
+
         if users_to_remove:
-            self.loader.remove_unlearn_users_from_shards(users_to_remove)
+            removed_shards_user = self.loader.remove_unlearn_users_from_shards(users_to_remove)
+            print(f"[REC REMOVE USER] target={users_to_remove}")
+            print(f"[REC REMOVE USER] removed_from_shards={removed_shards_user}")
+
         if items_to_remove:
-            self.loader.remove_unlearn_items_from_shards(items_to_remove)
+            removed_shards_item = self.loader.remove_unlearn_items_from_shards(items_to_remove)
+            print(f"[REC REMOVE ITEM] target={items_to_remove}")
+            print(f"[REC REMOVE ITEM] removed_from_shards={removed_shards_item}")
+
         if interactions_to_remove:
-            self.loader.remove_unlearn_interactions_from_shards(interactions_to_remove)
+            removed_shards_inter = self.loader.remove_unlearn_interactions_from_shards(interactions_to_remove)
+            print(f"[REC REMOVE INTERACTION] target={interactions_to_remove}")
+            print(f"[REC REMOVE INTERACTION] removed_from_shards={removed_shards_inter}")
 
-        retrain_shard_stats, total_retrain_users, total_retrain_items, total_retrain_interactions = \
-            self._collect_retrain_shard_stats(affected)
+        self._rebuild_global_remaining_data()
 
-        print("\n[REC RETRAIN DATA SIZE]")
-        print(f"  n_affected_shards          : {len(affected)}")
-        print(f"  total_retrain_users        : {total_retrain_users}")
-        print(f"  total_retrain_items        : {total_retrain_items}")
-        print(f"  total_retrain_interactions : {total_retrain_interactions}")
+        after_remove = int(self.loader.n_train)
 
-        local_epochs = getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1))
-        agg_epochs = getattr(
-            self.cfg,
-            "unlearn_agg_epochs",
-            getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1)),
+        print(f"[REC REMOVE CHECK] n_train before={before_remove}")
+        print(f"[REC REMOVE CHECK] n_train after ={after_remove}")
+        print(f"[REC REMOVE CHECK] removed       ={before_remove - after_remove}")
+
+        (
+            retrain_shard_stats,
+            total_retrain_users,
+            total_retrain_items,
+            total_retrain_interactions,
+        ) = self._collect_retrain_shard_stats(affected)
+
+        retrain_ratio = (
+            float(total_retrain_interactions) / float(original_total_interactions)
+            if original_total_interactions > 0 else 0.0
         )
 
         for sid in affected:
             print(f"\n[REC RETRAIN] shard={sid}")
-            print(f"  partition_type={self.partition_type}")
             print(f"  users={len(self.loader.C_U[sid])}")
             print(f"  items={len(self.loader.C_I[sid])}")
             print(f"  interactions={self.loader.n_C[sid]}")
 
             t0 = time.time()
-            local_stats = self.base_model.fit_local(
+            self.base_model.fit_local(
                 loader=self.loader,
                 local_id=sid,
-                epochs=local_epochs,
+                epochs=getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1)),
             )
             shard_train_time[sid] = time.time() - t0
 
-            print(f"  shard_retrain_time={shard_train_time[sid]:.4f}s")
-            if local_stats is not None:
-                print(f"  local_last_stats={local_stats}")
-
         affected_shard_time = sum(shard_train_time.values())
 
-        agg_time = 0.0
-        if getattr(self.cfg, "run_agg_after_unlearn", True):
-            agg_start = time.time()
-            agg_stats = self.base_model.fit_agg(
-                loader=self.loader,
-                epochs=agg_epochs,
-            )
-            agg_time = time.time() - agg_start
+        agg_epochs = int(getattr(self.cfg, "unlearn_agg_epochs", 1))
+        agg_epochs = max(1, agg_epochs)
 
-            print("\n[REC AGG RETRAIN]")
-            print(f"  agg_epochs={agg_epochs}")
-            print(f"  agg_train_time={agg_time:.4f}s")
-            if agg_stats is not None:
-                print(f"  agg_last_stats={agg_stats}")
-        else:
-            print("[REC UNLEARN] Skip aggregation after unlearning")
+        agg_start = time.time()
+        self.base_model.fit_agg(loader=self.loader, epochs=agg_epochs)
+        agg_time = time.time() - agg_start
 
         self.final_model = self.base_model
-        # DO NOT overwrite self.initial_model_state here.
-        # Keeping the original initial state is critical for independent runs.
         self._maybe_save_pretrain()
 
         retrain_time = affected_shard_time + agg_time
-        retrain_ratio = (
-            float(total_retrain_interactions) / float(original_total_interactions)
-            if original_total_interactions > 0 else 0.0
-        )
         sec_per_retrain_interaction = (
             retrain_time / total_retrain_interactions
             if total_retrain_interactions > 0 else 0.0

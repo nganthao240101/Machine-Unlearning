@@ -1,4 +1,3 @@
-
 import copy
 import os
 import random
@@ -53,12 +52,10 @@ class DataLoader:
         self.n_train = 0
         self.n_test = 0
 
-        # global backup
         self._original_train_user_dict = None
         self._original_exist_users = None
         self._original_n_train = None
 
-        # rec backup
         self._original_C = None
         self._original_C_U = None
         self._original_C_I = None
@@ -70,134 +67,130 @@ class DataLoader:
         self._original_community_to_item = None
         self._original_n_C = None
 
-        # adjacency cache for LightGCN
         self._global_adj_cache = None
         self._local_adj_cache = {}
 
         self._load_data()
 
-        if getattr(self.cfg, "use_partition_cache", False):
-            if self._load_partition_cache():
-                print("[Partition] Loaded from cache")
-            else:
-                print("[Partition] Cache not found -> building new partition")
-                self.shards = self._build_shards()
-                self._save_partition_cache()
-        else:
-            self.shards = self._build_shards()
+        self.shards = self._build_shards()
 
         self._backup_original_train_state()
         self._backup_original_partition_state()
 
     # =========================================================
     # cache
-    # =========================================================
-    def _get_partition_cache_path(self):
-        cache_dir = getattr(self.cfg, "partition_cache_dir", os.path.join("cache", "partition"))
-        os.makedirs(cache_dir, exist_ok=True)
+    # # =========================================================
+    # def _get_partition_cache_path(self):
+    #     cache_dir = getattr(self.cfg, "partition_cache_dir", os.path.join("cache", "partition"))
+    #     os.makedirs(cache_dir, exist_ok=True)
 
-        dataset = getattr(self.cfg, "dataset_name", "dataset")
-        partition_type = getattr(self.cfg, "partition_type", "user_based")
-        shard_num = getattr(self.cfg, "shard_num", 5)
-        seed = getattr(self.cfg, "seed", 2024)
-        model_type = getattr(self.cfg, "model_type", "model")
+    #     dataset = getattr(self.cfg, "dataset_name", "dataset")
+    #     method = getattr(self.cfg, "method", getattr(self.cfg, "method_type", "method"))
+    #     partition_type = getattr(self.cfg, "partition_type", "user_based")
+    #     shard_num = getattr(self.cfg, "shard_num", 5)
+    #     seed = getattr(self.cfg, "seed", 2024)
+    #     model_type = getattr(self.cfg, "model_type", "model")
 
-        fname = f"{dataset}__{model_type}__{partition_type}__shard{shard_num}__seed{seed}.pkl"
-        return os.path.join(cache_dir, fname)
+    #     fname = (
+    #         f"{dataset}__{model_type}__{method}__{partition_type}"
+    #         f"__shard{shard_num}__seed{seed}.pkl"
+    #     )
+    #     return os.path.join(cache_dir, fname)
 
-    def _save_partition_cache(self):
-        if self.method == "receraser":
-            if self.C is None:
-                return
-            data = {"mode": "receraser", "C": self.C, "C_U": self.C_U, "C_I": self.C_I}
-        else:
-            if self.shards is None:
-                return
-            data = {
-                "mode": self.method,
-                "shards": self.shards,
-                "partition_type": self.partition_type,
-            }
+    # def _save_partition_cache(self):
+    #     if self.method == "receraser":
+    #         if self.C is None:
+    #             return
+    #         data = {"mode": "receraser", "C": self.C, "C_U": self.C_U, "C_I": self.C_I}
+    #     else:
+    #         if self.shards is None:
+    #             return
+    #         data = {
+    #             "mode": self.method,
+    #             "shards": self.shards,
+    #             "partition_type": self.partition_type,
+    #         }
 
-        path = self._get_partition_cache_path()
-        with open(path, "wb") as f:
-            pkl.dump(data, f, protocol=pkl.HIGHEST_PROTOCOL)
+    #     path = self._get_partition_cache_path()
+    #     with open(path, "wb") as f:
+    #         pkl.dump(data, f, protocol=pkl.HIGHEST_PROTOCOL)
 
-        print(f"[Partition] Saved to {path}")
+    #     print(f"[Partition] Saved to {path}")
 
-    def _load_partition_cache(self):
-        path = self._get_partition_cache_path()
-        if not os.path.exists(path):
-            return False
+    # def _load_partition_cache(self):
+    #     path = self._get_partition_cache_path()
+    #     if not os.path.exists(path):
+    #         return False
 
-        try:
-            with open(path, "rb") as f:
-                data = pkl.load(f)
-        except Exception as e:
-            print(f"[Partition Cache] Corrupted -> rebuild ({e})")
-            return False
+    #     try:
+    #         with open(path, "rb") as f:
+    #             data = pkl.load(f)
+    #     except Exception as e:
+    #         print(f"[Partition Cache] Corrupted -> rebuild ({e})")
+    #         return False
 
-        mode = data.get("mode", None)
+    #     mode = data.get("mode", None)
 
-        if self.method == "receraser":
-            if mode != "receraser":
-                return False
-            self.C = data["C"]
-            self.C_U = data["C_U"]
-            self.C_I = data["C_I"]
-            self._rebuild_rec_metadata()
-            return True
+    #     if self.method == "receraser":
+    #         if mode != "receraser":
+    #             return False
+    #         self.C = data["C"]
+    #         self.C_U = data["C_U"]
+    #         self.C_I = data["C_I"]
+    #         self._rebuild_rec_metadata()
+    #         self.rebuild_global_train_from_shards()
+    #         return True
 
-        if self.method == "sisa":
-            if mode != "sisa":
-                return False
-            self.shards = data["shards"]
-            self.partition_type = data.get("partition_type", self.partition_type)
-            self.user_to_shards = self._build_user_to_shards(self.shards)
+    #     if self.method == "sisa":
+    #         if mode != "sisa":
+    #             return False
+    #         self.shards = data["shards"]
+    #         self.partition_type = data.get("partition_type", self.partition_type)
+    #         self.user_to_shards = self._build_user_to_shards(self.shards)
 
-            self.community_to_user = {
-                sid: sorted(list(shard.keys()))
-                for sid, shard in enumerate(self.shards)
-            }
-            self.community_to_item = {}
-            for sid, shard in enumerate(self.shards):
-                item_set = set()
-                for _, items in shard.items():
-                    item_set.update(items)
-                self.community_to_item[sid] = sorted(list(item_set))
+    #         self.community_to_user = {
+    #             sid: sorted(list(shard.keys()))
+    #             for sid, shard in enumerate(self.shards)
+    #         }
+    #         self.community_to_item = {}
+    #         for sid, shard in enumerate(self.shards):
+    #             item_set = set()
+    #             for _, items in shard.items():
+    #                 item_set.update(items)
+    #             self.community_to_item[sid] = sorted(list(item_set))
 
-            self.shard_data = self._generate_shard_data(self.shards)
-            self.unlearned_shard_data = copy.deepcopy(self.shard_data)
-            self._invalidate_adj_cache()
-            return True
+    #         self.shard_data = self._generate_shard_data(self.shards)
+    #         self.unlearned_shard_data = copy.deepcopy(self.shard_data)
+    #         self._invalidate_adj_cache()
+    #         return True
 
-        if self.method == "retrain":
-            if mode != "retrain":
-                return False
-            self.shards = data["shards"]
-            self.partition_type = "full"
+    #     if self.method == "retrain":
+    #         if mode != "retrain":
+    #             return False
+    #         self.shards = data["shards"]
+    #         self.partition_type = "full"
 
-            self.user_to_shards = {u: [0] for u in self.train_user_dict.keys()}
-            self.community_to_user = {0: sorted(self.train_user_dict.keys())}
-            self.community_to_item = {0: sorted(self.items)}
-            self.shard_data = {
-                0: {
-                    "partition_type": "full",
-                    "users": sorted(self.train_user_dict.keys()),
-                    "train_items": copy.deepcopy(self.train_user_dict),
-                    "items": sorted(self.items),
-                    "n_users": len(self.train_user_dict),
-                    "n_items": len(self.items),
-                    "n_interactions": sum(len(v) for v in self.train_user_dict.values()),
-                }
-            }
-            self.unlearned_shard_data = copy.deepcopy(self.shard_data)
-            self._invalidate_adj_cache()
-            return True
+    #         self.user_to_shards = {u: [0] for u in self.train_user_dict.keys()}
+    #         self.community_to_user = {0: sorted(self.train_user_dict.keys())}
+    #         self.community_to_item = {0: sorted(self.items)}
+    #         self.shard_data = {
+    #             0: {
+    #                 "partition_type": "full",
+    #                 "users": sorted(self.train_user_dict.keys()),
+    #                 "train_items": copy.deepcopy(self.train_user_dict),
+    #                 "items": sorted(self.items),
+    #                 "n_users": len(self.train_user_dict),
+    #                 "n_items": len(self.items),
+    #                 "n_interactions": sum(len(v) for v in self.train_user_dict.values()),
+    #             }
+    #         }
+    #         self.unlearned_shard_data = copy.deepcopy(self.shard_data)
+    #         self._invalidate_adj_cache()
+    #         return True
 
-        return False
+    #     return False
 
-    # =========================================================
+    # # =========================================================
     # basic io
     # =========================================================
     def _read_user_item_file(self, path):
@@ -339,6 +332,45 @@ class DataLoader:
         return shard_data
 
     # =========================================================
+    # rebuild global train data from shards
+    # =========================================================
+    def rebuild_global_train_from_shards(self):
+        merged = defaultdict(set)
+
+        if self.method == "receraser" and self.C is not None:
+            for sid in range(len(self.C)):
+                for u, items in self.C[sid].items():
+                    if not items:
+                        continue
+                    for i in items:
+                        merged[u].add(i)
+        elif self.unlearned_shard_data is not None:
+            for sid in self.unlearned_shard_data:
+                shard_train = self.unlearned_shard_data[sid]["train_items"]
+                for u, items in shard_train.items():
+                    if not items:
+                        continue
+                    for i in items:
+                        merged[u].add(i)
+        elif self.shard_data is not None:
+            for sid in self.shard_data:
+                shard_train = self.shard_data[sid]["train_items"]
+                for u, items in shard_train.items():
+                    if not items:
+                        continue
+                    for i in items:
+                        merged[u].add(i)
+
+        self.train_user_dict = {
+            u: sorted(list(items))
+            for u, items in merged.items()
+            if len(items) > 0
+        }
+        self.exist_users = sorted(self.train_user_dict.keys())
+        self.n_train = sum(len(items) for items in self.train_user_dict.values())
+        self._invalidate_adj_cache()
+
+    # =========================================================
     # adjacency helpers for LightGCN
     # =========================================================
     def _invalidate_adj_cache(self):
@@ -394,10 +426,6 @@ class DataLoader:
     # SISA helpers
     # =========================================================
     def _build_sisa_random_shards(self):
-        """
-        Interaction-based random shards for SISA.
-        Each interaction is assigned directly to a random shard.
-        """
         rng = random.Random(self.seed)
         interactions = self._flatten_interactions(self.train_user_dict)
         rng.shuffle(interactions)
@@ -411,9 +439,6 @@ class DataLoader:
         return shards
 
     def build_sisa_slices(self, shard_id):
-        """
-        Build cumulative slices for SISA.
-        """
         if self.method != "sisa":
             raise ValueError("build_sisa_slices() is only for method='sisa'.")
 
@@ -487,8 +512,6 @@ class DataLoader:
                 "n_interactions": n_local,
             }
 
-        self.exist_users = sorted([u for u, items in self.train_user_dict.items() if len(items) > 0])
-        self.n_train = sum(len(v) for v in self.train_user_dict.values())
         self.unlearned_shard_data = copy.deepcopy(self.shard_data)
         self._invalidate_adj_cache()
 
@@ -547,6 +570,7 @@ class DataLoader:
             partitioner = DataPartitioner(self.cfg)
             self.C, self.C_U, self.C_I = partitioner.partition(self.train_user_dict)
             self._rebuild_rec_metadata()
+            self.rebuild_global_train_from_shards()
             return self.shards
 
         raise ValueError("method must be one of: retrain, sisa, receraser")
@@ -578,55 +602,33 @@ class DataLoader:
         else:
             users = [self.py_rng.choice(valid_users) for _ in range(self.batch_size)]
 
-        def sample_pos_items_for_u(u, num):
-            pos_items = self.C[local].get(u, [])
-            if len(pos_items) == 0:
-                return []
-
-            pos_batch = []
-            while len(pos_batch) < num:
-                pos_i_id = self.py_rng.choice(pos_items)
-                if pos_i_id not in pos_batch:
-                    pos_batch.append(pos_i_id)
-            return pos_batch
-
-        def sample_neg_items_for_u(u, num):
-            neg_items = []
-            can_items = self.C_I[local] if local < len(self.C_I) else []
-
-            if len(can_items) > 0:
-                guard = 0
-                max_guard = len(can_items) * 10 + 50
-
-                while len(neg_items) < num and guard < max_guard:
-                    guard += 1
-                    neg_i_id = self.py_rng.choice(can_items)
-                    if neg_i_id not in self.train_user_dict.get(u, []) and neg_i_id not in neg_items:
-                        neg_items.append(neg_i_id)
-
-            guard = 0
-            max_guard = max(100, self.n_items * 2)
-            while len(neg_items) < num and guard < max_guard:
-                guard += 1
-                neg_i_id = self.py_rng.randint(0, self.n_items - 1)
-                if neg_i_id not in self.train_user_dict.get(u, []) and neg_i_id not in neg_items:
-                    neg_items.append(int(neg_i_id))
-
-            return neg_items
-
         final_users, pos_items, neg_items = [], [], []
+
         for u in users:
-            pos = sample_pos_items_for_u(u, 1)
-            if len(pos) == 0:
+            pos_list = self.C[local].get(u, [])
+            if len(pos_list) == 0:
                 continue
 
-            neg = sample_neg_items_for_u(u, 1)
-            if len(neg) == 0:
+            pos_i = self.py_rng.choice(pos_list)
+
+            neg_i = None
+            guard = 0
+            max_guard = max(200, self.n_items * 3)
+
+            # global negative sampling
+            while guard < max_guard:
+                guard += 1
+                cand = self.py_rng.randint(0, self.n_items - 1)
+                if cand not in self.train_user_dict.get(u, []):
+                    neg_i = int(cand)
+                    break
+
+            if neg_i is None:
                 continue
 
             final_users.append(u)
-            pos_items.extend(pos)
-            neg_items.extend(neg)
+            pos_items.append(pos_i)
+            neg_items.append(neg_i)
 
         return (
             np.asarray(final_users, dtype=np.int32),
@@ -648,44 +650,31 @@ class DataLoader:
         else:
             users = [self.py_rng.choice(valid_users) for _ in range(self.batch_size)]
 
-        def sample_pos_items_for_u(u, num):
-            pos_items = self.train_user_dict.get(u, [])
-            if len(pos_items) == 0:
-                return []
-
-            pos_batch = []
-            while len(pos_batch) < num:
-                pos_i_id = self.py_rng.choice(pos_items)
-                if pos_i_id not in pos_batch:
-                    pos_batch.append(pos_i_id)
-            return pos_batch
-
-        def sample_neg_items_for_u(u, num):
-            neg_items = []
-            guard = 0
-            max_guard = max(100, self.n_items * 2)
-
-            while len(neg_items) < num and guard < max_guard:
-                guard += 1
-                neg_id = self.py_rng.randint(0, self.n_items - 1)
-                if neg_id not in self.train_user_dict.get(u, []) and neg_id not in neg_items:
-                    neg_items.append(int(neg_id))
-
-            return neg_items
-
         final_users, pos_items, neg_items = [], [], []
+
         for u in users:
-            pos = sample_pos_items_for_u(u, 1)
-            if len(pos) == 0:
+            pos_list = self.train_user_dict.get(u, [])
+            if len(pos_list) == 0:
                 continue
 
-            neg = sample_neg_items_for_u(u, 1)
-            if len(neg) == 0:
+            pos_i = self.py_rng.choice(pos_list)
+
+            neg_i = None
+            guard = 0
+            max_guard = max(100, self.n_items * 2)
+            while guard < max_guard:
+                guard += 1
+                cand = self.py_rng.randint(0, self.n_items - 1)
+                if cand not in self.train_user_dict.get(u, []):
+                    neg_i = int(cand)
+                    break
+
+            if neg_i is None:
                 continue
 
             final_users.append(u)
-            pos_items.extend(pos)
-            neg_items.extend(neg)
+            pos_items.append(pos_i)
+            neg_items.append(neg_i)
 
         return (
             np.asarray(final_users, dtype=np.int32),
@@ -829,13 +818,8 @@ class DataLoader:
                 }
                 self.C[sid] = cleaned
 
-            self.train_user_dict = {
-                u: items
-                for u, items in self.train_user_dict.items()
-                if u not in u_set and len(items) > 0
-            }
-
             self._rebuild_rec_metadata()
+            self.rebuild_global_train_from_shards()
             return affected_shards
 
         if self.unlearned_shard_data is None:
@@ -879,14 +863,8 @@ class DataLoader:
                         cleaned[u] = new_items
                 self.C[sid] = cleaned
 
-            new_train = {}
-            for u, items in self.train_user_dict.items():
-                new_items = [i for i in items if i not in item_set]
-                if len(new_items) > 0:
-                    new_train[u] = new_items
-            self.train_user_dict = new_train
-
             self._rebuild_rec_metadata()
+            self.rebuild_global_train_from_shards()
             return affected_shards
 
         if self.unlearned_shard_data is None:
@@ -930,14 +908,8 @@ class DataLoader:
                         cleaned[u] = new_items
                 self.C[sid] = cleaned
 
-            new_train = {}
-            for u, items in self.train_user_dict.items():
-                new_items = [i for i in items if (u, i) not in interaction_set]
-                if len(new_items) > 0:
-                    new_train[u] = new_items
-            self.train_user_dict = new_train
-
             self._rebuild_rec_metadata()
+            self.rebuild_global_train_from_shards()
             return affected_shards
 
         if self.unlearned_shard_data is None:

@@ -5,7 +5,6 @@ import scipy.sparse as sp
 import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
-
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
@@ -19,32 +18,36 @@ class RecEraserLightGCNTF:
         self.lr = float(getattr(cfg, "lr", 1e-3))
         self.emb_dim = int(getattr(cfg, "emb_dim", 64))
         self.attention_size = max(1, self.emb_dim // 2)
+
         self.batch_size = int(getattr(cfg, "batch_size", 256))
         self.decay = float(getattr(cfg, "reg_lambda", 1e-4))
-        self.verbose = bool(getattr(cfg, "print_loss", True))
+        self.verbose = bool(getattr(cfg, "print_loss", False))
 
         self.num_local = int(getattr(cfg, "shard_num", 3))
         self.n_fold = int(getattr(cfg, "n_fold", 3))
-        self.n_layers = int(getattr(cfg, "gcn_layers", 2))
+
+        layer_size = getattr(cfg, "layer_size", None)
+        if layer_size is not None:
+            if isinstance(layer_size, str):
+                self.weight_size = eval(layer_size)
+            else:
+                self.weight_size = list(layer_size)
+            self.n_layers = len(self.weight_size)
+        else:
+            self.weight_size = [self.emb_dim, self.emb_dim]
+            self.n_layers = int(getattr(cfg, "gcn_layers", 2))
+
         self.keep_prob = float(getattr(cfg, "dropout", 1.0))
-        self.node_dropout_flag = False
+        self.node_dropout_flag = bool(getattr(cfg, "node_dropout_flag", False))
         self.seed = int(getattr(cfg, "seed", 2024))
 
         random.seed(self.seed)
         np.random.seed(self.seed)
 
         self.norm_adj = None
-        self.local_norm_adj = {}
-        self.global_norm_adj = None
-        self.local_adj_tuples = {}
-        self.global_adj_tuple = None
-        self.local_feed_templates = {}
-        self.agg_feed_template = None
-        self.predict_feed_template = None
-
-        # Keep signatures to avoid stale cache after unlearning
-        self._global_adj_signature = None
-        self._local_adj_signatures = {}
+        self.norm_adj_tuples = None
+        self.feed_template = None
+        self._adj_signature = None
 
         self.graph = tf.Graph()
         with self.graph.as_default():
@@ -60,11 +63,10 @@ class RecEraserLightGCNTF:
 
             self.weights = self._init_weights()
 
-            self.local_adj_placeholders = [
-                tf.sparse_placeholder(tf.float32, name=f"local_adj_{i}")
-                for i in range(self.num_local)
+            self.adj_placeholders = [
+                tf.sparse_placeholder(tf.float32, name=f"adj_{i}")
+                for i in range(self.num_local + 1)
             ]
-            self.global_adj_placeholder = tf.sparse_placeholder(tf.float32, name="global_adj")
 
             self.opt_local = []
             self.loss_local = []
@@ -97,9 +99,6 @@ class RecEraserLightGCNTF:
         self.sess = tf.Session(graph=self.graph, config=session_config)
         self.sess.run(self.init_op)
 
-    # =========================================================
-    # GRAPH BUILD
-    # =========================================================
     def _init_weights(self):
         all_weights = {}
         initializer = tf.random_normal_initializer(stddev=0.01)
@@ -116,7 +115,7 @@ class RecEraserLightGCNTF:
         stddev = np.sqrt(2.0 / float(self.attention_size + self.emb_dim))
 
         all_weights["WA"] = tf.Variable(
-            tf.random.truncated_normal(
+            tf.truncated_normal(
                 shape=[self.emb_dim, self.attention_size],
                 mean=0.0,
                 stddev=stddev
@@ -134,7 +133,7 @@ class RecEraserLightGCNTF:
         )
 
         all_weights["WB"] = tf.Variable(
-            tf.random.truncated_normal(
+            tf.truncated_normal(
                 shape=[self.emb_dim, self.attention_size],
                 mean=0.0,
                 stddev=stddev
@@ -159,6 +158,7 @@ class RecEraserLightGCNTF:
             initializer([self.num_local, self.emb_dim]),
             name="trans_B"
         )
+
         return all_weights
 
     def _convert_sp_mat_to_sp_tensor(self, X):
@@ -171,8 +171,8 @@ class RecEraserLightGCNTF:
 
     def _split_A_hat_from_placeholder(self, adj_sp_tensor):
         A_fold_hat = []
-
         fold_len = (self.n_users + self.n_items) // self.n_fold
+
         for i_fold in range(self.n_fold):
             start = i_fold * fold_len
             if i_fold == self.n_fold - 1:
@@ -180,7 +180,11 @@ class RecEraserLightGCNTF:
             else:
                 end = (i_fold + 1) * fold_len
 
-            fold = tf.sparse_slice(adj_sp_tensor, [start, 0], [end - start, self.n_users + self.n_items])
+            fold = tf.sparse_slice(
+                adj_sp_tensor,
+                [start, 0],
+                [end - start, self.n_users + self.n_items]
+            )
             A_fold_hat.append(fold)
 
         return A_fold_hat
@@ -192,10 +196,11 @@ class RecEraserLightGCNTF:
         return mf_loss
 
     def _create_lightgcn_embed_local(self, local_num):
-        A_fold_hat = self._split_A_hat_from_placeholder(self.local_adj_placeholders[local_num])
+        A_fold_hat = self._split_A_hat_from_placeholder(self.adj_placeholders[local_num])
 
         ego_embeddings = tf.concat(
-            [self.weights["user_embedding"][:, local_num], self.weights["item_embedding"][:, local_num]],
+            [self.weights["user_embedding"][:, local_num],
+             self.weights["item_embedding"][:, local_num]],
             axis=0
         )
         all_embeddings = [ego_embeddings]
@@ -215,7 +220,7 @@ class RecEraserLightGCNTF:
         return u_g_embeddings, i_g_embeddings
 
     def _create_lightgcn_embed(self, u_e, i_e):
-        A_fold_hat = self._split_A_hat_from_placeholder(self.global_adj_placeholder)
+        A_fold_hat = self._split_A_hat_from_placeholder(self.adj_placeholders[self.num_local])
 
         ego_embeddings = tf.concat([u_e, i_e], axis=0)
         all_embeddings = [ego_embeddings]
@@ -252,11 +257,17 @@ class RecEraserLightGCNTF:
             tf.nn.l2_loss(pos_i_g_embeddings_pre) +
             tf.nn.l2_loss(neg_i_g_embeddings_pre)
         )
-        regularizer = regularizer / tf.cast(tf.maximum(tf.shape(self.users)[0], 1), tf.float32)
+        regularizer = regularizer / self.batch_size
+
         emb_loss = self.decay * regularizer
         loss = mf_loss + emb_loss
 
-        batch_ratings = tf.matmul(u_g_embeddings, pos_i_g_embeddings, transpose_a=False, transpose_b=True)
+        batch_ratings = tf.matmul(
+            u_g_embeddings,
+            pos_i_g_embeddings,
+            transpose_a=False,
+            transpose_b=True
+        )
         opt = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(loss)
 
         return opt, loss, mf_loss, emb_loss, batch_ratings
@@ -266,20 +277,25 @@ class RecEraserLightGCNTF:
             embs_w = tf.exp(
                 tf.einsum(
                     "abc,ck->abk",
-                    tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WA"]) + self.weights["BA"]),
+                    tf.nn.relu(
+                        tf.einsum("abc,ck->abk", embs, self.weights["WA"]) + self.weights["BA"]
+                    ),
                     self.weights["HA"]
                 )
             )
+            embs_w = tf.div(embs_w, tf.reduce_sum(embs_w, 1, keep_dims=True))
         else:
             embs_w = tf.exp(
                 tf.einsum(
                     "abc,ck->abk",
-                    tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WB"]) + self.weights["BB"]),
+                    tf.nn.relu(
+                        tf.einsum("abc,ck->abk", embs, self.weights["WB"]) + self.weights["BB"]
+                    ),
                     self.weights["HB"]
                 )
             )
+            embs_w = tf.div(embs_w, tf.reduce_sum(embs_w, 1, keep_dims=True))
 
-        embs_w = tf.divide(embs_w, tf.reduce_sum(embs_w, 1, keepdims=True) + 1e-10)
         agg_emb = tf.reduce_sum(tf.multiply(embs_w, embs), 1)
         return agg_emb, embs_w
 
@@ -294,95 +310,73 @@ class RecEraserLightGCNTF:
         i_e, _ = self.attention_based_agg(i_es, 1)
 
         ua_embeddings, ia_embeddings = self._create_lightgcn_embed(u_e, i_e)
+        # cache final embeddings graph
+        self.ua_embeddings_eval = ua_embeddings
+        self.ia_embeddings_eval = ia_embeddings
 
         u_g_embeddings = tf.nn.embedding_lookup(ua_embeddings, self.users)
         pos_i_g_embeddings = tf.nn.embedding_lookup(ia_embeddings, self.pos_items)
         neg_i_g_embeddings = tf.nn.embedding_lookup(ia_embeddings, self.neg_items)
 
-        u_drop = tf.nn.dropout(u_g_embeddings, keep_prob=self.dropout_keep_prob)
+        # TF2 warning fix:
+        # old: tf.nn.dropout(u_g_embeddings, self.dropout_keep_prob)
+        # new: rate = 1 - keep_prob
+        u_drop = tf.nn.dropout(
+            u_g_embeddings,
+            rate=1.0 - self.dropout_keep_prob
+        )
+
         mf_loss = self.create_bpr_loss(u_drop, pos_i_g_embeddings, neg_i_g_embeddings)
         loss = mf_loss
 
-        batch_ratings = tf.matmul(u_g_embeddings, pos_i_g_embeddings, transpose_a=False, transpose_b=True)
+        batch_ratings = tf.matmul(
+            u_g_embeddings,
+            pos_i_g_embeddings,
+            transpose_a=False,
+            transpose_b=True
+        )
         opt = tf.train.AdamOptimizer(learning_rate=self.lr).minimize(loss)
 
         return opt, loss, mf_loss, batch_ratings, u_w
 
-    # =========================================================
-    # ADJ BUILD / CACHE
-    # =========================================================
-    def _matrix_signature(self, mat):
-        mat = mat.tocsr()
-        return (mat.shape[0], mat.shape[1], int(mat.nnz))
+    def _matrix_signature(self, mats):
+        sig = []
+        for mat in mats:
+            mat = mat.tocsr()
+            sig.append((mat.shape[0], mat.shape[1], int(mat.nnz)))
+        return tuple(sig)
 
     def _reset_adj_cache(self):
         self.norm_adj = None
-        self.local_norm_adj = {}
-        self.global_norm_adj = None
-        self.local_adj_tuples = {}
-        self.global_adj_tuple = None
-        self.local_feed_templates = {}
-        self.agg_feed_template = None
-        self.predict_feed_template = None
-        self._global_adj_signature = None
-        self._local_adj_signatures = {}
+        self.norm_adj_tuples = None
+        self.feed_template = None
+        self._adj_signature = None
 
     def _prepare_adj_cache(self, loader, force=False):
         if force:
             self._reset_adj_cache()
 
         if not (hasattr(loader, "get_adj_mat") and hasattr(loader, "get_adj_mat_local")):
-            raise ValueError("Loader must provide get_adj_mat() and get_adj_mat_local() for RecEraserLightGCN.")
+            raise ValueError("Loader must provide get_adj_mat() and get_adj_mat_local().")
 
-        global_adj = loader.get_adj_mat()
-        local_adjs = [loader.get_adj_mat_local(lid) for lid in range(self.num_local)]
+        mats = [loader.get_adj_mat_local(i) for i in range(self.num_local)]
+        mats.append(loader.get_adj_mat())
 
-        new_global_sig = self._matrix_signature(global_adj)
-        new_local_sigs = {lid: self._matrix_signature(local_adjs[lid]) for lid in range(self.num_local)}
-
-        if (
-            self.global_adj_tuple is not None
-            and self._global_adj_signature == new_global_sig
-            and self._local_adj_signatures == new_local_sigs
-        ):
+        new_sig = self._matrix_signature(mats)
+        if self.feed_template is not None and self._adj_signature == new_sig:
             return
 
-        self.global_norm_adj = global_adj
-        self.global_adj_tuple = self._convert_sp_mat_to_sp_tensor(self.global_norm_adj)
+        self.norm_adj = mats
+        self.norm_adj_tuples = [self._convert_sp_mat_to_sp_tensor(mat) for mat in mats]
+        self._adj_signature = new_sig
 
-        self.local_norm_adj = {}
-        self.local_adj_tuples = {}
-        for lid in range(self.num_local):
-            self.local_norm_adj[lid] = local_adjs[lid]
-            self.local_adj_tuples[lid] = self._convert_sp_mat_to_sp_tensor(local_adjs[lid])
-
-        self._global_adj_signature = new_global_sig
-        self._local_adj_signatures = new_local_sigs
-
-        self.local_feed_templates = {}
-        eye_tuple = self._convert_sp_mat_to_sp_tensor(
-            sp.eye(self.n_users + self.n_items, dtype=np.float32).tocsr()
-        )
-
-        for local_id in range(self.num_local):
-            base_feed = {
-                self.global_adj_placeholder: self.global_adj_tuple,
-            }
-            for lid in range(self.num_local):
-                base_feed[self.local_adj_placeholders[lid]] = self.local_adj_tuples.get(lid, eye_tuple)
-            self.local_feed_templates[local_id] = base_feed
-
-        self.agg_feed_template = {
-            self.global_adj_placeholder: self.global_adj_tuple,
-        }
-        for lid in range(self.num_local):
-            self.agg_feed_template[self.local_adj_placeholders[lid]] = self.local_adj_tuples.get(lid, eye_tuple)
-
-        self.predict_feed_template = dict(self.agg_feed_template)
+        self.feed_template = {}
+        for i in range(self.num_local + 1):
+            self.feed_template[self.adj_placeholders[i]] = self.norm_adj_tuples[i]
 
     def _local_feed(self, loader, local_id, users, pos_items, neg_items):
         self._prepare_adj_cache(loader)
-        feed = dict(self.local_feed_templates[local_id])
+        feed = dict(self.feed_template)
         feed.update({
             self.users: users,
             self.pos_items: pos_items,
@@ -393,7 +387,7 @@ class RecEraserLightGCNTF:
 
     def _agg_feed(self, loader, users, pos_items, neg_items):
         self._prepare_adj_cache(loader)
-        feed = dict(self.agg_feed_template)
+        feed = dict(self.feed_template)
         feed.update({
             self.users: users,
             self.pos_items: pos_items,
@@ -402,12 +396,8 @@ class RecEraserLightGCNTF:
         })
         return feed
 
-    # =========================================================
-    # TRAIN / PREDICT / STATE
-    # =========================================================
     def fit_local_epoch(self, loader, local_id):
-        # force refresh to avoid stale local/global graph after unlearn
-        self._prepare_adj_cache(loader, force=True)
+        self._prepare_adj_cache(loader, force=False)
 
         n_batch = max(1, loader.n_C[local_id] // self.batch_size + 1)
         loss = mf_loss = reg_loss = 0.0
@@ -440,8 +430,7 @@ class RecEraserLightGCNTF:
         return float(loss / eff_batch), float(mf_loss / eff_batch), float(reg_loss / eff_batch)
 
     def fit_agg_epoch(self, loader):
-        # force refresh to avoid stale graph after unlearn
-        self._prepare_adj_cache(loader, force=True)
+        self._prepare_adj_cache(loader, force=False)
 
         n_batch = max(1, loader.n_train // self.batch_size + 1)
         loss = mf_loss = 0.0
@@ -471,28 +460,71 @@ class RecEraserLightGCNTF:
 
         return float(loss / eff_batch), float(mf_loss / eff_batch)
 
+    # def predict(self, user_id, loader=None):
+        if loader is not None:
+            self._prepare_adj_cache(loader, force=False)
+        elif self.feed_template is None:
+            raise ValueError("Adjacency is not prepared. Run training before predict(), or pass loader.")
+
+        user_arr = np.full(shape=(self.n_items,), fill_value=int(user_id), dtype=np.int32)
+        item_arr = np.arange(self.n_items, dtype=np.int32)
+        dummy_neg = np.zeros(self.n_items, dtype=np.int32)
+
+        feed = dict(self.feed_template)
+        feed.update({
+            self.users: user_arr,
+            self.pos_items: item_arr,
+            self.neg_items: dummy_neg,
+            self.dropout_keep_prob: 1.0,
+        })
+
+        scores = self.sess.run(self.batch_ratings, feed_dict=feed)
+        return np.diag(scores)
     def predict(self, user_id, loader=None):
         if loader is not None:
-            self._prepare_adj_cache(loader, force=True)
-        elif self.predict_feed_template is None:
-            raise ValueError("Adjacency is not prepared. Run training before predict(), or pass loader to predict().")
+            self._prepare_adj_cache(loader, force=False)
+        elif self.feed_template is None:
+            raise ValueError(
+                "Adjacency is not prepared. "
+                "Run training before predict(), or pass loader."
+            )
 
-        with self.graph.as_default():
-            user_arr = np.full(shape=(self.n_items,), fill_value=int(user_id), dtype=np.int32)
-            item_arr = np.arange(self.n_items, dtype=np.int32)
-            dummy_neg = np.zeros(self.n_items, dtype=np.int32)
+        # repeat user embedding for all items
+        user_arr = np.full(
+            shape=(self.n_items,),
+            fill_value=int(user_id),
+            dtype=np.int32
+        )
 
-            feed = dict(self.predict_feed_template)
-            feed.update({
-                self.users: user_arr,
-                self.pos_items: item_arr,
-                self.neg_items: dummy_neg,
-                self.dropout_keep_prob: 1.0,
-            })
-            scores = self.sess.run(self.batch_ratings, feed_dict=feed)
+        # all candidate items
+        item_arr = np.arange(self.n_items, dtype=np.int32)
 
-        return np.diag(scores)
+        feed = dict(self.feed_template)
+        feed.update({
+            self.users: user_arr,
+            self.pos_items: item_arr,
+            self.dropout_keep_prob: 1.0,
+        })
 
+        # direct dot-product inference
+        scores = self.sess.run(
+            tf.reduce_sum(
+                tf.multiply(
+                    tf.nn.embedding_lookup(
+                        self.ua_embeddings_eval,
+                        self.users
+                    ),
+                    tf.nn.embedding_lookup(
+                        self.ia_embeddings_eval,
+                        self.pos_items
+                    )
+                ),
+                axis=1
+            ),
+            feed_dict=feed
+        )
+
+        return scores
     def get_state(self):
         with self.graph.as_default():
             values = self.sess.run(tf.global_variables())
@@ -522,11 +554,20 @@ class RecEraserLightGCNWrapper:
         self.model = RecEraserLightGCNTF(cfg, n_users, n_items)
         self._last_loader = None
 
-    def fit_local(self, loader, local_id, epochs=None):
+    def set_loader(self, loader):
+        """
+        Important when loading RecEraser init cache:
+        cache restores weights only, but predict still needs adjacency from loader.
+        """
         self._last_loader = loader
+        self.model._prepare_adj_cache(loader, force=True)
+
+    def fit_local(self, loader, local_id, epochs=None):
+        self.set_loader(loader)
+        self.model._prepare_adj_cache(loader, force=True)
 
         if epochs is None:
-            epochs = getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1))
+            epochs = int(getattr(self.cfg, "local_epochs", getattr(self.cfg, "epochs", 1)))
 
         last_stats = None
         for epoch in range(epochs):
@@ -548,10 +589,11 @@ class RecEraserLightGCNWrapper:
         return last_stats
 
     def fit_agg(self, loader, epochs=None):
-        self._last_loader = loader
+        self.set_loader(loader)
+        self.model._prepare_adj_cache(loader, force=True)
 
         if epochs is None:
-            epochs = getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1))
+            epochs = int(getattr(self.cfg, "epoch_agg", getattr(self.cfg, "agg_epochs", 1)))
 
         last_stats = None
         for epoch in range(epochs):
@@ -571,6 +613,11 @@ class RecEraserLightGCNWrapper:
         return last_stats
 
     def predict(self, user_id):
+        if self._last_loader is None:
+            raise ValueError(
+                "RecEraserLightGCNWrapper has no loader. "
+                "Call set_loader(loader) after loading cache, or run fit_local/fit_agg first."
+            )
         return self.model.predict(user_id, loader=self._last_loader)
 
     def get_state(self):

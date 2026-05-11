@@ -1,3 +1,6 @@
+import os
+
+
 class Config:
     def __init__(self):
         # =========================
@@ -5,14 +8,14 @@ class Config:
         # =========================
         self.method_type = "receraser"   # retrain | sisa | receraser | all
         self.method = self.method_type
-        self.model_type = "bpr"    # bpr | lightgcn
+        self.model_type = "bpr"          # bpr | lightgcn
 
         # =========================
         # dataset / paths
         # =========================
-        self.dataset_name = "yelp2018"   # ml-1m | ml-10m|yelp2018
-        self.train_path = "data/yelp2018/train.txt"
-        self.test_path = "data/yelp2018/test.txt"
+        self.dataset_name = "ml-10m"      # ml-1m | ml-10m | yelp2018
+        self.train_path = os.path.join("data", self.dataset_name, "train.txt")
+        self.test_path = os.path.join("data", self.dataset_name, "test.txt")
 
         self.ckpt_dir = "ckpt"
         self.result_dir = "results"
@@ -25,17 +28,19 @@ class Config:
         self.emb_dim = 64
         self.gcn_layers = 3
         self.lr = 0.001
-        self.epochs = 5
-        self.local_epochs = 1
+        self.epochs = 10
+        self.local_epochs = 3
         self.batch_size = 1024
-        self.reg_lambda = 1e-4
-        self.dropout = 0.7
+        self.reg_lambda = 1e-3
+        self.dropout = 0.8
         self.print_loss = True
+        # self.eval_item_batch_size = 128
+        # self.max_agg_batches = 20
 
         # =========================
         # partition
         # =========================
-        self.receraser_partition_type = "user_based"   # user_based | item_based | interaction_based
+        self.receraser_partition_type = "interaction_based"   # user_based | item_based | interaction_based
         self.sisa_partition_type = "interaction_based"
 
         self.partition_type = self.receraser_partition_type
@@ -47,11 +52,19 @@ class Config:
         self.shard_num = 10
         self.slice_num = 5
 
+        # partition params for DataPartitioner
+        self.interaction_partition_iters = 5
+        self.interaction_capacity_ratio = 1.2
+        self.user_partition_iters = 5
+        self.user_capacity_ratio = 1.2
+        self.item_partition_iters = 5
+        self.item_capacity_ratio = 1.2
+
         # =========================
         # unlearning
         # =========================
-        self.unlearn_type = "user"   # user | interaction | item
-        self.unlearn_eval_runs = 1
+        self.unlearn_type = "item"   # user | interaction | item
+        self.unlearn_eval_runs = 5
         self.unlearn_seed = 2024
 
         self.unlearn_user_count = 1
@@ -69,11 +82,11 @@ class Config:
         # =========================
         # RecEraser aggregation
         # =========================
-        self.epoch_agg = 1
+        self.epoch_agg = 5
         self.agg_epochs = self.epoch_agg
         self.unlearn_agg_epochs = 1
         self.run_agg_after_unlearn = True
-        self.agg_sample_ratio = 1
+        self.agg_sample_ratio = 1.0   # 1.0 = full remaining data
 
         # =========================
         # cache
@@ -82,11 +95,49 @@ class Config:
         self.partition_cache_dir = "cache/partition"
 
         self.receraser_init_cache_dir = "cache/receraser_init"
-        self.use_receraser_init_cache = False
-        self.save_receraser_init_cache = False
+        self.use_receraser_init_cache = True
+        self.save_receraser_init_cache = True
+
+        # =========================
+        # pretrain
+        # =========================
+        self.pretrain_dir = os.path.join("data", self.dataset_name)
+        self.save_pretrain = False
+
+        self.user_pretrain_path = None
+        self.item_pretrain_path = None
+        self._update_pretrain_paths()
+
+    def _update_pretrain_paths(self):
+        if self.model_type == "bpr":
+            self.user_pretrain_path = os.path.join(
+                "data", self.dataset_name, "user_pretrain_bpr.pk"
+            )
+            self.item_pretrain_path = os.path.join(
+                "data", self.dataset_name, "item_pretrain_bpr.pk"
+            )
+        elif self.model_type == "lightgcn":
+            self.user_pretrain_path = os.path.join(
+                "data", self.dataset_name, "user_pretrain_lightgcn.pk"
+            )
+            self.item_pretrain_path = os.path.join(
+                "data", self.dataset_name, "item_pretrain_lightgcn.pk"
+            )
+        else:
+            self.user_pretrain_path = os.path.join(
+                "data", self.dataset_name, "user_pretrain.pk"
+            )
+            self.item_pretrain_path = os.path.join(
+                "data", self.dataset_name, "item_pretrain.pk"
+            )
 
     def sync_alias_fields(self):
         self.method = self.method_type
+
+        # sync dataset paths in case dataset_name changed later
+        self.train_path = os.path.join("data", self.dataset_name, "train.txt")
+        self.test_path = os.path.join("data", self.dataset_name, "test.txt")
+        self.pretrain_dir = os.path.join("data", self.dataset_name)
 
         if self.method_type == "receraser":
             self.partition_type = self.receraser_partition_type
@@ -98,3 +149,5 @@ class Config:
         self.partition_method = self.partition_type
         self.shard_mode = self.partition_type
         self.agg_epochs = self.epoch_agg
+
+        self._update_pretrain_paths()

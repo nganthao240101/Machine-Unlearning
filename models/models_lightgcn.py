@@ -30,8 +30,19 @@ class LightGCN(object):
         self.verbose = bool(getattr(cfg, "print_loss", False))
         self.seed = int(getattr(cfg, "seed", 2024))
 
-        self.n_fold = 10
-        self.n_layers = int(getattr(cfg, "gcn_layers", 3))
+        self.n_fold = int(getattr(cfg, "n_fold", 10))
+
+        layer_size = getattr(cfg, "layer_size", None)
+        if layer_size is not None:
+            if isinstance(layer_size, str):
+                self.weight_size = eval(layer_size)
+            else:
+                self.weight_size = list(layer_size)
+            self.n_layers = len(self.weight_size)
+        else:
+            self.weight_size = [self.emb_dim] * int(getattr(cfg, "gcn_layers", 3))
+            self.n_layers = len(self.weight_size)
+
         self.node_dropout_flag = False
 
         self.norm_adj = None
@@ -166,7 +177,7 @@ class LightGCN(object):
             tf.nn.l2_loss(self.pos_i_g_embeddings_pre) +
             tf.nn.l2_loss(self.neg_i_g_embeddings_pre)
         )
-        regularizer = regularizer / tf.cast(tf.shape(users)[0], tf.float32)
+        regularizer = regularizer / self.batch_size
 
         mf_loss = tf.reduce_mean(tf.nn.softplus(-(pos_scores - neg_scores)))
         emb_loss = self.decay * regularizer

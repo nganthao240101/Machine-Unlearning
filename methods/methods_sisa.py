@@ -6,12 +6,6 @@ import numpy as np
 
 
 class SISAEnsembleModel:
-    """
-    Final SISA model for recommender:
-    - keep one trained model per shard
-    - aggregate prediction scores across shard models
-    """
-
     def __init__(self, shard_models):
         self.shard_models = dict(shard_models)
 
@@ -34,22 +28,6 @@ class SISAEnsembleModel:
 
 
 class SISAMethod:
-    """
-    SISA for recommender project.
-
-    Design choice in this project:
-    - SISA uses interaction-based shards
-    - loader.build_sisa_slices(shard_id) should return cumulative slices
-    - one final model per shard
-    - final inference aggregates scores across shard models
-
-    This version fixes:
-    - initial_train truly loads previous stage checkpoint
-    - unlearn resets loader to original state before each run
-    - every unlearning run restores ORIGINAL shard models
-    - retrain_ratio is preserved and computed from original_n_train
-    """
-
     def __init__(self, cfg, loader, model):
         self.cfg = cfg
         self.loader = loader
@@ -60,9 +38,8 @@ class SISAMethod:
         self.base_model = model
         self.partition_type = "interaction_based"
         self.slice_num = int(getattr(cfg, "slice_num", 3))
-        self.final_model = None
-
         self.total_epochs = int(getattr(cfg, "epochs", 1))
+        self.final_model = None
 
         self.original_shards = copy.deepcopy(loader.shards)
         self.original_shard_data = copy.deepcopy(loader.shard_data)
@@ -77,7 +54,53 @@ class SISAMethod:
         os.makedirs(getattr(self.cfg, "ckpt_dir", "ckpt"), exist_ok=True)
 
     # =========================================================
-    # helpers
+    # checkpoint helpers
+    # =========================================================
+    def _safe_name(self, x):
+        return str(x).replace("/", "_").replace("\\", "_").replace(" ", "_")
+
+    def _ckpt_root(self):
+        dataset = self._safe_name(getattr(self.cfg, "dataset_name", "unknown_dataset"))
+        model = self._safe_name(getattr(self.cfg, "model_type", "unknown_model"))
+        shard_num = self._safe_name(getattr(self.cfg, "shard_num", len(self.loader.shards)))
+        slice_num = self._safe_name(getattr(self.cfg, "slice_num", self.slice_num))
+        epochs = self._safe_name(getattr(self.cfg, "epochs", self.total_epochs))
+
+        root = os.path.join(
+            getattr(self.cfg, "ckpt_dir", "ckpt"),
+            "sisa",
+            dataset,
+            model,
+            f"shards_{shard_num}",
+            f"slices_{slice_num}",
+            f"epochs_{epochs}",
+            "interaction_based",
+            "initial"
+        )
+
+        os.makedirs(root, exist_ok=True)
+        return root
+
+    def _ckpt_path(self, shard_id, stage_id):
+        path = os.path.join(
+            self._ckpt_root(),
+            f"shard_{int(shard_id)}",
+            f"stage_{int(stage_id)}.pkl"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def _save_state(self, state, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            pkl.dump(state, f, protocol=pkl.HIGHEST_PROTOCOL)
+
+    def _load_state(self, path):
+        with open(path, "rb") as f:
+            return pkl.load(f)
+
+    # =========================================================
+    # model helpers
     # =========================================================
     def _new_model(self):
         if not isinstance(self.base_model, type) and hasattr(self.base_model, "clone_fresh"):
@@ -93,9 +116,8 @@ class SISAMethod:
                     return self.base_model()
 
         raise TypeError(
-            "SISAMethod expects model to be either:\n"
-            "- an instance with clone_fresh(), or\n"
-            "- a model class that can be initialized."
+            "SISAMethod expects model to be either an instance with clone_fresh(), "
+            "or a model class that can be initialized."
         )
 
     def _clone_model_from_state(self, state):
@@ -105,47 +127,24 @@ class SISAMethod:
         return model
 
     def _restore_initial_shard_models(self):
-        restored = {}
         if len(self.initial_shard_model_states) == 0:
             return
 
+        restored = {}
         for shard_id, state in self.initial_shard_model_states.items():
             restored[shard_id] = self._clone_model_from_state(state)
 
         self.shard_models = restored
         self._build_final_ensemble()
 
-    def _ckpt_path(self, shard_id, stage_id):
-        return os.path.join(
-            self.cfg.ckpt_dir,
-            f"sisa_shard{shard_id}_stage{stage_id}.pkl"
-        )
-
-    def _save_state(self, state, path):
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "wb") as f:
-            pkl.dump(state, f, protocol=pkl.HIGHEST_PROTOCOL)
-
-    def _load_state(self, path):
-        with open(path, "rb") as f:
-            return pkl.load(f)
-
-    def _get_slices_for_shard(self, shard_id):
-        """
-        Cache only for initial training.
-        During unlearning, we rebuild slices from modified shard data.
-        """
-        if shard_id not in self.shard_slices:
-            self.shard_slices[shard_id] = self.loader.build_sisa_slices(shard_id)
-        return self.shard_slices[shard_id]
-
-    def _rebuild_slices_for_unlearned_shard(self, shard_id):
-        return self.loader.build_sisa_slices(shard_id)
-
+    # =========================================================
+    # data helpers
+    # =========================================================
     def _reset_loader_to_original(self):
         if hasattr(self.loader, "reset_all_train_state"):
             self.loader.reset_all_train_state()
             return
+
         if hasattr(self.loader, "reset_partition_state"):
             self.loader.reset_partition_state()
             return
@@ -160,66 +159,25 @@ class SISAMethod:
         if hasattr(self.loader, "_invalidate_adj_cache"):
             self.loader._invalidate_adj_cache()
 
-    def _build_final_ensemble(self):
-        if len(self.shard_models) == 0:
-            raise ValueError("No shard models available for SISA ensemble.")
-        self.final_model = SISAEnsembleModel(self.shard_models)
-        return self.final_model
+    def _get_slices_for_shard(self, shard_id):
+        if shard_id not in self.shard_slices:
+            self.shard_slices[shard_id] = self.loader.build_sisa_slices(shard_id)
+        return self.shard_slices[shard_id]
+
+    def _rebuild_slices_for_unlearned_shard(self, shard_id):
+        return self.loader.build_sisa_slices(shard_id)
 
     def _calc_stats(self, train_dict):
         n_users = len(train_dict)
         n_interactions = sum(len(v) for v in train_dict.values())
+
         item_pool = set()
         for _, items in train_dict.items():
             item_pool.update(items)
-        n_items = len(item_pool)
-        return n_users, n_items, n_interactions
 
-    def _find_earliest_affected_slice(
-        self,
-        shard_id,
-        users_to_remove=None,
-        items_to_remove=None,
-        interactions_to_remove=None,
-        slices=None,
-    ):
-        users_to_remove = set(users_to_remove or [])
-        items_to_remove = set(items_to_remove or [])
-        interactions_to_remove = set((int(u), int(i)) for u, i in (interactions_to_remove or []))
-
-        if slices is None:
-            slices = self._get_slices_for_shard(shard_id)
-
-        for slice_id, slice_user_dict in enumerate(slices):
-            affected = False
-
-            if users_to_remove and any(u in users_to_remove for u in slice_user_dict.keys()):
-                affected = True
-
-            if (not affected) and items_to_remove:
-                for _, items in slice_user_dict.items():
-                    if any(i in items_to_remove for i in items):
-                        affected = True
-                        break
-
-            if (not affected) and interactions_to_remove:
-                for u, items in slice_user_dict.items():
-                    for i in items:
-                        if (u, i) in interactions_to_remove:
-                            affected = True
-                            break
-                    if affected:
-                        break
-
-            if affected:
-                return slice_id
-
-        return None
+        return n_users, len(item_pool), n_interactions
 
     def _get_slice_epoch_schedule(self, n_slices):
-        """
-        Distribute total training budget across slices.
-        """
         n_slices = max(1, int(n_slices))
         total_epochs = max(1, int(self.total_epochs))
 
@@ -239,21 +197,96 @@ class SISAMethod:
         epochs = max(1, int(epochs))
         return model.fit(train_dict, epochs=epochs)
 
-    def _load_previous_stage_if_needed(self, model, shard_id, stage_id):
-        """
-        stage_id is zero-based.
-        If stage_id == 0 => fresh model.
-        Else load checkpoint from previous stage.
-        """
+    # =========================================================
+    # SISA helpers
+    # =========================================================
+    def _build_final_ensemble(self):
+        if len(self.shard_models) == 0:
+            raise ValueError("No shard models available for SISA ensemble.")
+
+        self.final_model = SISAEnsembleModel(self.shard_models)
+        return self.final_model
+
+    def _find_earliest_affected_slice(
+        self,
+        shard_id,
+        users_to_remove=None,
+        items_to_remove=None,
+        interactions_to_remove=None,
+        slices=None,
+    ):
+        users_to_remove = set(users_to_remove or [])
+        items_to_remove = set(items_to_remove or [])
+        interactions_to_remove = set(
+            (int(u), int(i)) for u, i in (interactions_to_remove or [])
+        )
+
+        if slices is None:
+            slices = self._get_slices_for_shard(shard_id)
+
+        for slice_id, slice_user_dict in enumerate(slices):
+            affected = False
+
+            if users_to_remove:
+                if any(u in users_to_remove for u in slice_user_dict.keys()):
+                    affected = True
+
+            if (not affected) and items_to_remove:
+                for _, items in slice_user_dict.items():
+                    if any(i in items_to_remove for i in items):
+                        affected = True
+                        break
+
+            if (not affected) and interactions_to_remove:
+                for u, items in slice_user_dict.items():
+                    for i in items:
+                        if (int(u), int(i)) in interactions_to_remove:
+                            affected = True
+                            break
+                    if affected:
+                        break
+
+            if affected:
+                return slice_id
+
+        return None
+
+    def _load_previous_stage_for_initial(self, model, shard_id, stage_id):
         if stage_id <= 0:
             print("    ckpt_in=FRESH")
             return
 
         prev_path = self._ckpt_path(shard_id, stage_id - 1)
+
         if not os.path.exists(prev_path):
             raise FileNotFoundError(
-                f"Previous checkpoint not found for shard={shard_id}, "
-                f"stage={stage_id}: {prev_path}"
+                f"Previous initial checkpoint not found: {prev_path}"
+            )
+
+        print(f"    ckpt_in={prev_path}")
+        state = self._load_state(prev_path)
+        model.set_state(state)
+
+    def _load_start_state_for_unlearn(self, model, shard_id, earliest_stage):
+        """
+        Unlearn chỉ load checkpoint initial trước slice bị ảnh hưởng.
+
+        earliest_stage == 0:
+            train lại từ đầu shard đó.
+
+        earliest_stage > 0:
+            load initial/stage_{earliest_stage - 1}.pkl
+            rồi retrain tiếp trong RAM.
+        """
+        if earliest_stage <= 0:
+            print("    ckpt_in=FRESH")
+            return
+
+        prev_path = self._ckpt_path(shard_id, earliest_stage - 1)
+
+        if not os.path.exists(prev_path):
+            raise FileNotFoundError(
+                f"Missing initial checkpoint before affected stage: {prev_path}"
             )
 
         print(f"    ckpt_in={prev_path}")
@@ -266,8 +299,11 @@ class SISAMethod:
     def initial_train(self):
         print("=== INITIAL TRAIN: SISA ===")
         print("  partition_type=interaction_based")
+        print(f"  dataset_name={getattr(self.cfg, 'dataset_name', 'unknown_dataset')}")
+        print(f"  model_type={getattr(self.cfg, 'model_type', 'unknown_model')}")
         print(f"  slice_num={self.slice_num}")
         print(f"  total_epochs={self.total_epochs}")
+        print(f"  ckpt_root={self._ckpt_root()}")
 
         start = time.time()
         shard_train_time = {}
@@ -301,7 +337,7 @@ class SISAMethod:
                 stage_epochs = slice_epoch_schedule[stage_id]
 
                 print(
-                    f"  [Shard {shard_id} | Stage {stage_id+1}/{len(slices)}] "
+                    f"  [Shard {shard_id} | Stage {stage_id + 1}/{len(slices)}] "
                     f"cumulative_users={cur_users}, "
                     f"cumulative_items={cur_items}, "
                     f"cumulative_interactions={cur_interactions}, "
@@ -313,11 +349,11 @@ class SISAMethod:
                     continue
 
                 stage_model = self._new_model()
-                self._load_previous_stage_if_needed(stage_model, shard_id, stage_id)
+                self._load_previous_stage_for_initial(stage_model, shard_id, stage_id)
 
                 stage_start = time.time()
                 self._fit_model_for_epochs(stage_model, stage_train_dict, stage_epochs)
-                shard_elapsed += (time.time() - stage_start)
+                shard_elapsed += time.time() - stage_start
 
                 curr_ckpt = self._ckpt_path(shard_id, stage_id)
                 self._save_state(stage_model.get_state(), curr_ckpt)
@@ -332,7 +368,9 @@ class SISAMethod:
             self.shard_models[shard_id] = final_stage_model
 
             if hasattr(final_stage_model, "get_state"):
-                self.initial_shard_model_states[shard_id] = copy.deepcopy(final_stage_model.get_state())
+                self.initial_shard_model_states[shard_id] = copy.deepcopy(
+                    final_stage_model.get_state()
+                )
             else:
                 self.initial_shard_model_states[shard_id] = None
 
@@ -345,8 +383,11 @@ class SISAMethod:
         return {
             "status": "initial_train_done",
             "partition_type": "interaction_based",
+            "dataset_name": getattr(self.cfg, "dataset_name", "unknown_dataset"),
+            "model_type": getattr(self.cfg, "model_type", "unknown_model"),
             "slice_num": self.slice_num,
             "total_epochs": self.total_epochs,
+            "ckpt_root": self._ckpt_root(),
             "shard_train_time": shard_train_time,
             "all_shard_train_time": total_shard_time,
             "agg_train_time": agg_time,
@@ -357,16 +398,26 @@ class SISAMethod:
     # =========================================================
     # unlearn
     # =========================================================
-    def unlearn(self, users_to_remove=None, items_to_remove=None, interactions_to_remove=None):
+    def unlearn(
+        self,
+        users_to_remove=None,
+        items_to_remove=None,
+        interactions_to_remove=None
+    ):
         print("\n=== UNLEARN: SISA ===")
         print("  partition_type=interaction_based")
+        print(f"  dataset_name={getattr(self.cfg, 'dataset_name', 'unknown_dataset')}")
+        print(f"  model_type={getattr(self.cfg, 'model_type', 'unknown_model')}")
+        print(f"  ckpt_root={self._ckpt_root()}")
 
         users_to_remove = sorted(set(users_to_remove or []))
         items_to_remove = sorted(set(items_to_remove or []))
-        interactions_to_remove = sorted(set((int(u), int(i)) for u, i in (interactions_to_remove or [])))
+        interactions_to_remove = sorted(
+            set((int(u), int(i)) for u, i in (interactions_to_remove or []))
+        )
 
-        # Every unlearn run starts from ORIGINAL data + ORIGINAL shard models.
         self._reset_loader_to_original()
+
         if len(self.initial_shard_model_states) > 0:
             self._restore_initial_shard_models()
 
@@ -378,12 +429,17 @@ class SISAMethod:
             self.loader.find_affected_shards_by_interactions(interactions_to_remove)
         ))
 
+        print(f"[SISA UNLEARN] users_to_remove={users_to_remove}")
+        print(f"[SISA UNLEARN] items_to_remove={items_to_remove}")
+        print(f"[SISA UNLEARN] interactions_to_remove={interactions_to_remove}")
         print(f"[SISA UNLEARN] affected_shards={affected_shards}")
 
         if users_to_remove:
             self.loader.remove_unlearn_users_from_shards(users_to_remove)
+
         if items_to_remove:
             self.loader.remove_unlearn_items_from_shards(items_to_remove)
+
         if interactions_to_remove:
             self.loader.remove_unlearn_interactions_from_shards(interactions_to_remove)
 
@@ -402,6 +458,7 @@ class SISAMethod:
             total_retrain_interactions += shard_info["n_interactions"]
 
             original_slices = self._get_slices_for_shard(shard_id)
+
             earliest_stage = self._find_earliest_affected_slice(
                 shard_id,
                 users_to_remove=users_to_remove,
@@ -411,17 +468,23 @@ class SISAMethod:
             )
 
             if earliest_stage is None:
-                print(f"[SISA RETRAIN] shard={shard_id} has no affected stage -> skip")
+                print(f"[SISA RETRAIN] shard={shard_id} has no affected slice -> skip")
                 continue
 
-            print(f"[SISA RETRAIN] shard={shard_id}, from_stage={earliest_stage+1}")
+            print(
+                f"[SISA RETRAIN] shard={shard_id}, "
+                f"earliest_affected_slice={earliest_stage}, "
+                f"retrain_from_stage={earliest_stage + 1}"
+            )
 
             new_slices = self._rebuild_slices_for_unlearned_shard(shard_id)
             slice_epoch_schedule = self._get_slice_epoch_schedule(len(new_slices))
+
             print(f"  slice_epoch_schedule={slice_epoch_schedule}")
 
             shard_elapsed = 0.0
             final_stage_model = None
+            current_model = None
 
             for stage_id in range(earliest_stage, len(new_slices)):
                 stage_train_dict = new_slices[stage_id]
@@ -429,7 +492,7 @@ class SISAMethod:
                 stage_epochs = slice_epoch_schedule[stage_id]
 
                 print(
-                    f"  [Shard {shard_id} | Retrain Stage {stage_id+1}/{len(new_slices)}] "
+                    f"  [Shard {shard_id} | Retrain Stage {stage_id + 1}/{len(new_slices)}] "
                     f"cumulative_users={cur_users}, "
                     f"cumulative_items={cur_items}, "
                     f"cumulative_interactions={cur_interactions}, "
@@ -440,32 +503,21 @@ class SISAMethod:
                     print("    Empty stage data -> skip")
                     continue
 
-                stage_model = self._new_model()
-
-                if stage_id == earliest_stage:
-                    if earliest_stage > 0:
-                        prev_path = self._ckpt_path(shard_id, earliest_stage - 1)
-                        if not os.path.exists(prev_path):
-                            raise FileNotFoundError(
-                                f"Missing checkpoint before affected stage: {prev_path}"
-                            )
-                        print(f"    ckpt_in={prev_path}")
-                        state = self._load_state(prev_path)
-                        stage_model.set_state(state)
-                    else:
-                        print("    ckpt_in=FRESH")
+                if current_model is None:
+                    current_model = self._new_model()
+                    self._load_start_state_for_unlearn(
+                        current_model,
+                        shard_id,
+                        earliest_stage
+                    )
                 else:
-                    self._load_previous_stage_if_needed(stage_model, shard_id, stage_id)
+                    print("    ckpt_in=PREVIOUS_STAGE_IN_MEMORY")
 
                 stage_start = time.time()
-                self._fit_model_for_epochs(stage_model, stage_train_dict, stage_epochs)
-                shard_elapsed += (time.time() - stage_start)
+                self._fit_model_for_epochs(current_model, stage_train_dict, stage_epochs)
+                shard_elapsed += time.time() - stage_start
 
-                curr_ckpt = self._ckpt_path(shard_id, stage_id)
-                self._save_state(stage_model.get_state(), curr_ckpt)
-                print(f"    ckpt_out={curr_ckpt}")
-
-                final_stage_model = stage_model
+                final_stage_model = current_model
 
             if final_stage_model is not None:
                 self.shard_models[shard_id] = final_stage_model
@@ -479,6 +531,7 @@ class SISAMethod:
         agg_time = time.time() - agg_start
 
         retrain_time = affected_shard_time + agg_time
+
         retrain_ratio = (
             float(total_retrain_interactions) / float(self.original_n_train)
             if self.original_n_train > 0 else 0.0
@@ -487,6 +540,8 @@ class SISAMethod:
         return self.final_model, {
             "status": "unlearn_done",
             "partition_type": "interaction_based",
+            "dataset_name": getattr(self.cfg, "dataset_name", "unknown_dataset"),
+            "model_type": getattr(self.cfg, "model_type", "unknown_model"),
             "affected_users": users_to_remove,
             "affected_items": items_to_remove,
             "affected_interactions": interactions_to_remove,
@@ -498,6 +553,7 @@ class SISAMethod:
             "retrain_ratio": retrain_ratio,
             "slice_num": self.slice_num,
             "total_epochs": self.total_epochs,
+            "ckpt_root": self._ckpt_root(),
             "shard_train_time": shard_train_time,
             "affected_shard_time": affected_shard_time,
             "agg_train_time": agg_time,

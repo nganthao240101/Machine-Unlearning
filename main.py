@@ -1,3 +1,6 @@
+# Modified main.py: save separate CSV files for Retrain / SISA / RecEraser
+# with filenames including dataset, model, method, partition type, unlearn type, runs, shard count.
+
 import csv
 import math
 import os
@@ -5,9 +8,6 @@ import random
 import time
 import numpy as np
 
-# =========================================================
-# GPU / CPU AUTO SETUP
-# =========================================================
 def setup_device():
     requested = str(os.environ.get("DEVICE", "auto")).strip().lower()
     gpu_id = str(os.environ.get("GPU_ID", "0")).strip()
@@ -29,11 +29,9 @@ def setup_device():
     if requested == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
         return "CPU"
-
     if requested == "gpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         return f"GPU:{gpu_id}"
-
     if has_gpu():
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
         return f"GPU:{gpu_id}"
@@ -47,7 +45,6 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 from config import Config
 from data_loader import DataLoader
 from core.registry import build_model, build_method
-
 
 def build_cfg(method_type='receraser', model_type='bpr'):
     cfg = Config()
@@ -228,12 +225,6 @@ def print_method_breakdown(method_name, stats):
     print(f"  agg_train_time               = {stats.get('agg_train_time', 0.0):.4f}s")
     print(f"  retrain_time                 = {stats.get('retrain_time', 0.0):.4f}s")
     print(f"  total_time                   = {stats.get('total_time', 0.0):.4f}s")
-    retrain_shard_stats = stats.get('retrain_shard_stats', {})
-    if retrain_shard_stats:
-        print('  retrain_shard_stats:')
-        for sid in sorted(retrain_shard_stats.keys()):
-            shard_stat = retrain_shard_stats[sid]
-            print(f"    shard={sid} | users={shard_stat.get('users', 0)} | items={shard_stat.get('items', 0)} | interactions={shard_stat.get('interactions', 0)}")
 
 def build_loader_model_method(cfg):
     loader = DataLoader(cfg)
@@ -242,7 +233,6 @@ def build_loader_model_method(cfg):
     return loader, method
 
 def run_retrain_initial(cfg):
-    print('\n================ RETRAIN: INITIAL TRAIN ================')
     loader = DataLoader(cfg)
     ModelClass = build_model(cfg, loader.n_users, loader.n_items)
     model = ModelClass(cfg, loader.n_users, loader.n_items)
@@ -251,38 +241,47 @@ def run_retrain_initial(cfg):
     elapsed = time.time() - t0
     metrics = evaluate_model(model, loader.train_user_dict, loader.test_user_dict, loader.n_items, cfg.topk_list)
     stats = {'train_time': elapsed, 'retrain_time': elapsed, 'total_time': elapsed}
-    display_time = stats.get('train_time', elapsed)
-    print(f'[RETRAIN][INITIAL] train_time={display_time:.4f}s')
-    print(f'[RETRAIN][INITIAL] raw_elapsed={elapsed:.4f}s')
-    print(f'[RETRAIN][INITIAL] last_stats={fit_stats}')
-    print_metrics('RETRAIN INITIAL ACCURACY', metrics, cfg.topk_list)
-    return loader, model, display_time, metrics, stats
+    return loader, model, stats.get('train_time', elapsed), metrics, stats
+
+# def run_method_initial(cfg, method_name):
+#     loader, method = build_loader_model_method(cfg)
+#     t0 = time.time()
+#     stats = method.initial_train()
+#     elapsed = time.time() - t0
+#     final_model = get_final_model_from_method(method)
+#     metrics = evaluate_model(final_model, loader.train_user_dict, loader.test_user_dict, loader.n_items, cfg.topk_list)
+#     return loader, method, get_display_initial_time(stats, elapsed), metrics, stats
 
 def run_method_initial(cfg, method_name):
-    print(f'\n================ {method_name.upper()}: INITIAL TRAIN ================')
     loader, method = build_loader_model_method(cfg)
+
+    print(f"[{method_name}] START initial_train")
     t0 = time.time()
     stats = method.initial_train()
     elapsed = time.time() - t0
-    display_time = get_display_initial_time(stats, elapsed)
-    final_model = get_final_model_from_method(method)
-    metrics = evaluate_model(final_model, loader.train_user_dict, loader.test_user_dict, loader.n_items, cfg.topk_list)
-    print(f'[{method_name.upper()}][INITIAL] train_time={display_time:.4f}s')
-    print(f'[{method_name.upper()}][INITIAL] raw_elapsed={elapsed:.4f}s')
-    print(f'[{method_name.upper()}][INITIAL] stats={stats}')
-    print_metrics(f'{method_name.upper()} INITIAL ACCURACY', metrics, cfg.topk_list)
-    if isinstance(stats, dict):
-        print(f'\n[{method_name.upper()}][INITIAL][BREAKDOWN]')
-        print(f"  all_shard_train_time = {stats.get('all_shard_train_time', -1):.4f}s")
-        print(f"  agg_train_time       = {stats.get('agg_train_time', -1):.4f}s")
-        print(f"  train_time           = {stats.get('train_time', -1):.4f}s")
-        print(f"  total_time           = {stats.get('total_time', -1):.4f}s")
-    return loader, method, display_time, metrics, stats
+    print(f"[{method_name}] FINISH initial_train")
 
+    final_model = get_final_model_from_method(method)
+
+    print(f"[{method_name}] START initial evaluate")
+
+    if method_name == "receraser":
+        metrics = {}
+        print(f"[{method_name}] SKIP initial evaluate for speed")
+    else:
+        metrics = evaluate_model(
+            final_model,
+            loader.train_user_dict,
+            loader.test_user_dict,
+            loader.n_items,
+            cfg.topk_list
+        )
+        print(f"[{method_name}] FINISH initial evaluate")
+
+    return loader, method, get_display_initial_time(stats, elapsed), metrics, stats
 def run_retrain_unlearn_user(cfg, target_users):
     loader = DataLoader(cfg)
     target_user_set = set(target_users)
-    print(f'[RETRAIN] Unlearn target users: {list(target_users)}')
     train_after = {u: items for u, items in loader.train_user_dict.items() if u not in target_user_set and len(items) > 0}
     ModelClass = build_model(cfg, loader.n_users, loader.n_items)
     model = ModelClass(cfg, loader.n_users, loader.n_items)
@@ -291,13 +290,11 @@ def run_retrain_unlearn_user(cfg, target_users):
     elapsed = time.time() - t0
     metrics = evaluate_model(model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
     stats = {'train_time': elapsed, 'retrain_time': elapsed, 'total_time': elapsed, 'affected_shards': ['full_retrain'], 'n_affected_shards': 1, 'total_retrain_users': len(train_after), 'total_retrain_items': len({i for items in train_after.values() for i in items}), 'total_retrain_interactions': sum(len(v) for v in train_after.values())}
-    display_time = stats.get('retrain_time', elapsed)
-    return display_time, metrics, stats
+    return stats.get('retrain_time', elapsed), metrics, stats
 
 def run_retrain_unlearn_interaction(cfg, target_interactions):
     loader = DataLoader(cfg)
     interaction_set = set((int(u), int(i)) for u, i in target_interactions)
-    print(f'[RETRAIN] Unlearn target interactions: {list(target_interactions)}')
     train_after = {}
     for u, items in loader.train_user_dict.items():
         new_items = [i for i in items if (u, i) not in interaction_set]
@@ -310,13 +307,11 @@ def run_retrain_unlearn_interaction(cfg, target_interactions):
     elapsed = time.time() - t0
     metrics = evaluate_model(model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
     stats = {'train_time': elapsed, 'retrain_time': elapsed, 'total_time': elapsed, 'affected_shards': ['full_retrain'], 'n_affected_shards': 1, 'total_retrain_users': len(train_after), 'total_retrain_items': len({i for items in train_after.values() for i in items}), 'total_retrain_interactions': sum(len(v) for v in train_after.values())}
-    display_time = stats.get('retrain_time', elapsed)
-    return display_time, metrics, stats
+    return stats.get('retrain_time', elapsed), metrics, stats
 
 def run_retrain_unlearn_item(cfg, target_items):
     loader = DataLoader(cfg)
     item_set = set(target_items)
-    print(f'[RETRAIN] Unlearn target items: {list(target_items)}')
     train_after = {}
     for u, items in loader.train_user_dict.items():
         new_items = [i for i in items if i not in item_set]
@@ -329,8 +324,7 @@ def run_retrain_unlearn_item(cfg, target_items):
     elapsed = time.time() - t0
     metrics = evaluate_model(model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
     stats = {'train_time': elapsed, 'retrain_time': elapsed, 'total_time': elapsed, 'affected_shards': ['full_retrain'], 'n_affected_shards': 1, 'total_retrain_users': len(train_after), 'total_retrain_items': len({i for items in train_after.values() for i in items}), 'total_retrain_interactions': sum(len(v) for v in train_after.values())}
-    display_time = stats.get('retrain_time', elapsed)
-    return display_time, metrics, stats
+    return stats.get('retrain_time', elapsed), metrics, stats
 
 def _reset_loader_for_unlearn(loader):
     if hasattr(loader, 'reset_all_train_state'):
@@ -341,8 +335,6 @@ def _reset_loader_for_unlearn(loader):
         loader.reset_global_train_data()
 
 def run_method_unlearn_user(loader, method, cfg, target_users, method_name):
-    print(f'\n================ {method_name.upper()}: UNLEARN USER ================')
-    print(f'[{method_name.upper()}] target users = {list(target_users)}')
     _reset_loader_for_unlearn(loader)
     target_user_set = set(target_users)
     t0 = time.time()
@@ -351,16 +343,9 @@ def run_method_unlearn_user(loader, method, cfg, target_users, method_name):
     display_time = get_display_retrain_time(stats, elapsed)
     train_after = {u: items for u, items in loader.train_user_dict.items() if u not in target_user_set and len(items) > 0}
     metrics = evaluate_model(final_model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
-    print(f'[{method_name.upper()}][UNLEARN USERS={target_users}] retrain_time={display_time:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN USERS={target_users}] raw_elapsed={elapsed:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN USER] stats={stats}')
-    print_metrics(f'{method_name.upper()} AFTER USER UNLEARN', metrics, cfg.topk_list)
-    print_method_breakdown(method_name.upper(), stats)
     return display_time, merge_stats(stats), metrics
 
 def run_method_unlearn_interaction(loader, method, cfg, target_interactions, method_name):
-    print(f'\n================ {method_name.upper()}: UNLEARN INTERACTION ================')
-    print(f'[{method_name.upper()}] target interactions = {list(target_interactions)}')
     _reset_loader_for_unlearn(loader)
     interaction_set = set((int(u), int(i)) for u, i in target_interactions)
     t0 = time.time()
@@ -373,16 +358,9 @@ def run_method_unlearn_interaction(loader, method, cfg, target_interactions, met
         if len(new_items) > 0:
             train_after[u] = new_items
     metrics = evaluate_model(final_model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
-    print(f'[{method_name.upper()}][UNLEARN INTERACTIONS={target_interactions}] retrain_time={display_time:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN INTERACTIONS={target_interactions}] raw_elapsed={elapsed:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN INTERACTION] stats={stats}')
-    print_metrics(f'{method_name.upper()} AFTER INTERACTION UNLEARN', metrics, cfg.topk_list)
-    print_method_breakdown(method_name.upper(), stats)
     return display_time, merge_stats(stats), metrics
 
 def run_method_unlearn_item(loader, method, cfg, target_items, method_name):
-    print(f'\n================ {method_name.upper()}: UNLEARN ITEM ================')
-    print(f'[{method_name.upper()}] target items = {list(target_items)}')
     _reset_loader_for_unlearn(loader)
     item_set = set(target_items)
     t0 = time.time()
@@ -395,26 +373,27 @@ def run_method_unlearn_item(loader, method, cfg, target_items, method_name):
         if len(new_items) > 0:
             train_after[u] = new_items
     metrics = evaluate_model(final_model, train_after, loader.test_user_dict, loader.n_items, cfg.topk_list)
-    print(f'[{method_name.upper()}][UNLEARN ITEMS={target_items}] retrain_time={display_time:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN ITEMS={target_items}] raw_elapsed={elapsed:.4f}s')
-    print(f'[{method_name.upper()}][UNLEARN ITEM] stats={stats}')
-    print_metrics(f'{method_name.upper()} AFTER ITEM UNLEARN', metrics, cfg.topk_list)
-    print_method_breakdown(method_name.upper(), stats)
     return display_time, merge_stats(stats), metrics
 
 def ensure_dir(path):
     os.makedirs(path, exist_ok=True)
 
-def build_csv_path(cfg):
+def _safe_name(x):
+    return str(x).strip().lower().replace(' ', '_')
+
+def build_csv_path_for_method(cfg, method_name, partition_type=None):
     csv_dir = getattr(cfg, 'result_dir', 'results')
     ensure_dir(csv_dir)
-    unlearn_type = getattr(cfg, 'unlearn_type', 'user')
-    model_type = getattr(cfg, 'model_type', 'bpr')
-    partition_type = getattr(cfg, 'partition_type', 'user_based')
-    dataset_name = getattr(cfg, 'dataset_name', 'dataset')
-    num_runs = getattr(cfg, 'unlearn_eval_runs', 5)
-    shard_num = getattr(cfg, 'shard_num', 10)
-    filename = f"{dataset_name}__{model_type}__{partition_type}__{unlearn_type}__runs{num_runs}__shard{shard_num}.csv"
+    dataset_name = _safe_name(getattr(cfg, 'dataset_name', 'dataset'))
+    model_type = _safe_name(getattr(cfg, 'model_type', 'bpr'))
+    unlearn_type = _safe_name(getattr(cfg, 'unlearn_type', 'user'))
+    num_runs = int(getattr(cfg, 'unlearn_eval_runs', 5))
+    shard_num = int(getattr(cfg, 'shard_num', 10))
+    method_name = _safe_name(method_name)
+    if partition_type is None:
+        partition_type = getattr(cfg, 'partition_type', 'unknown')
+    partition_type = _safe_name(partition_type)
+    filename = f"{dataset_name}__{model_type}__{method_name}__{partition_type}__{unlearn_type}__runs{num_runs}__shard{shard_num}.csv"
     return os.path.join(csv_dir, filename)
 
 def build_csv_header(topk_list):
@@ -440,26 +419,21 @@ def write_csv(csv_path, rows, topk_list):
     for k in topk_list:
         numeric_fields.append(f"recall@{k}")
         numeric_fields.append(f"ndcg@{k}")
-    grouped = {}
-    for row in rows:
-        grouped.setdefault(row["method"], []).append(row)
-    avg_rows = []
-    for method_name, method_rows in grouped.items():
-        avg = {k: "" for k in header}
+    avg = {k: "" for k in header}
+    if len(rows) > 0:
         avg["run_id"] = "AVG"
-        avg["method"] = method_name
+        avg["method"] = rows[0]["method"]
         for field in numeric_fields:
-            values = [float(r[field]) for r in method_rows if r[field] != ""]
+            values = [float(r[field]) for r in rows if r[field] != ""]
             if len(values) > 0:
                 avg[field] = sum(values) / len(values)
-        avg_rows.append(avg)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=header)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
-        writer.writerow({})
-        for avg in avg_rows:
+        if len(rows) > 0:
+            writer.writerow({})
             writer.writerow(avg)
 
 def print_average_summary(rows, topk_list):
@@ -503,27 +477,13 @@ def main():
     retrain_loader = retrain_model = None
     sisa_loader = sisa_method = None
     rec_loader = rec_method = None
-    retrain_initial_time = retrain_initial_metrics = None
-    sisa_initial_time = sisa_initial_metrics = None
-    rec_initial_time = rec_initial_metrics = None
 
     if method_mode in ['retrain', 'all']:
-        retrain_loader, retrain_model, retrain_initial_time, retrain_initial_metrics, _ = run_retrain_initial(cfg_retrain)
+        retrain_loader, retrain_model, _, _, _ = run_retrain_initial(cfg_retrain)
     if method_mode in ['sisa', 'all']:
-        sisa_loader, sisa_method, sisa_initial_time, sisa_initial_metrics, _ = run_method_initial(cfg_sisa, 'sisa')
+        sisa_loader, sisa_method, _, _, _ = run_method_initial(cfg_sisa, 'sisa')
     if method_mode in ['receraser', 'all']:
-        rec_loader, rec_method, rec_initial_time, rec_initial_metrics, _ = run_method_initial(cfg_rec, 'receraser')
-
-    print('\n================ INITIAL TRAIN COMPARISON ================')
-    if retrain_initial_time is not None:
-        print(f'Retrain initial time   : {retrain_initial_time:.4f}s')
-        print_metrics('RETRAIN INITIAL', retrain_initial_metrics, cfg_base.topk_list)
-    if sisa_initial_time is not None:
-        print(f'SISA initial time      : {sisa_initial_time:.4f}s')
-        print_metrics('SISA INITIAL', sisa_initial_metrics, cfg_base.topk_list)
-    if rec_initial_time is not None:
-        print(f'RecEraser initial time : {rec_initial_time:.4f}s')
-        print_metrics('RECERASER INITIAL', rec_initial_metrics, cfg_base.topk_list)
+        rec_loader, rec_method, _, _, _ = run_method_initial(cfg_rec, 'receraser')
 
     num_runs = int(getattr(cfg_base, 'unlearn_eval_runs', 5))
     unlearn_type = str(getattr(cfg_base, 'unlearn_type', 'user')).lower()
@@ -545,60 +505,77 @@ def main():
     else:
         raise ValueError("unlearn_type must be 'user', 'interaction', or 'item'")
 
-    csv_rows = []
+    method_rows = {'Retrain': [], 'SISA': [], 'RecEraser': []}
+
     for run_id, target in enumerate(targets, start=1):
         print_target_banner(run_id, num_runs, unlearn_type, target)
-        retrain_time = retrain_metrics = retrain_stats = None
-        sisa_time = sisa_metrics = sisa_stats = None
-        rec_time = rec_metrics = rec_stats = None
+
+        retrain_time = None
+        sisa_time = None
+        rec_time = None
 
         if unlearn_type == 'user':
             if method_mode in ['retrain', 'all']:
                 retrain_time, retrain_metrics, retrain_stats = run_retrain_unlearn_user(cfg_retrain, target)
+                method_rows['Retrain'].append(metrics_to_row(run_id, unlearn_type, target, 'Retrain', retrain_time, retrain_stats, retrain_metrics, cfg_base.topk_list))
             if method_mode in ['sisa', 'all']:
                 sisa_time, sisa_stats, sisa_metrics = run_method_unlearn_user(sisa_loader, sisa_method, cfg_sisa, target, 'sisa')
+                method_rows['SISA'].append(metrics_to_row(run_id, unlearn_type, target, 'SISA', sisa_time, sisa_stats, sisa_metrics, cfg_base.topk_list))
             if method_mode in ['receraser', 'all']:
                 rec_time, rec_stats, rec_metrics = run_method_unlearn_user(rec_loader, rec_method, cfg_rec, target, 'receraser')
+                method_rows['RecEraser'].append(metrics_to_row(run_id, unlearn_type, target, 'RecEraser', rec_time, rec_stats, rec_metrics, cfg_base.topk_list))
         elif unlearn_type == 'interaction':
             if method_mode in ['retrain', 'all']:
                 retrain_time, retrain_metrics, retrain_stats = run_retrain_unlearn_interaction(cfg_retrain, target)
+                method_rows['Retrain'].append(metrics_to_row(run_id, unlearn_type, target, 'Retrain', retrain_time, retrain_stats, retrain_metrics, cfg_base.topk_list))
             if method_mode in ['sisa', 'all']:
                 sisa_time, sisa_stats, sisa_metrics = run_method_unlearn_interaction(sisa_loader, sisa_method, cfg_sisa, target, 'sisa')
+                method_rows['SISA'].append(metrics_to_row(run_id, unlearn_type, target, 'SISA', sisa_time, sisa_stats, sisa_metrics, cfg_base.topk_list))
             if method_mode in ['receraser', 'all']:
                 rec_time, rec_stats, rec_metrics = run_method_unlearn_interaction(rec_loader, rec_method, cfg_rec, target, 'receraser')
+                method_rows['RecEraser'].append(metrics_to_row(run_id, unlearn_type, target, 'RecEraser', rec_time, rec_stats, rec_metrics, cfg_base.topk_list))
         elif unlearn_type == 'item':
             if method_mode in ['retrain', 'all']:
                 retrain_time, retrain_metrics, retrain_stats = run_retrain_unlearn_item(cfg_retrain, target)
+                method_rows['Retrain'].append(metrics_to_row(run_id, unlearn_type, target, 'Retrain', retrain_time, retrain_stats, retrain_metrics, cfg_base.topk_list))
             if method_mode in ['sisa', 'all']:
                 sisa_time, sisa_stats, sisa_metrics = run_method_unlearn_item(sisa_loader, sisa_method, cfg_sisa, target, 'sisa')
+                method_rows['SISA'].append(metrics_to_row(run_id, unlearn_type, target, 'SISA', sisa_time, sisa_stats, sisa_metrics, cfg_base.topk_list))
             if method_mode in ['receraser', 'all']:
                 rec_time, rec_stats, rec_metrics = run_method_unlearn_item(rec_loader, rec_method, cfg_rec, target, 'receraser')
+                method_rows['RecEraser'].append(metrics_to_row(run_id, unlearn_type, target, 'RecEraser', rec_time, rec_stats, rec_metrics, cfg_base.topk_list))
 
-        print(f'\n---------------- RUN {run_id} RESULT SUMMARY ----------------')
+        print('\n---------------- RUN SUMMARY ----------------')
         if retrain_time is not None:
-            print(f'Retrain time   : {retrain_time:.4f}s')
-            print_metrics('RETRAIN', retrain_metrics, cfg_base.topk_list)
-            print_method_breakdown('RETRAIN', retrain_stats)
+            print(f'Retrain   : {retrain_time:.4f}s')
         if sisa_time is not None:
-            print(f'SISA time      : {sisa_time:.4f}s')
-            print_metrics('SISA', sisa_metrics, cfg_base.topk_list)
-            print_method_breakdown('SISA', sisa_stats)
+            print(f'SISA      : {sisa_time:.4f}s')
         if rec_time is not None:
-            print(f'RecEraser time : {rec_time:.4f}s')
-            print_metrics('RECERASER', rec_metrics, cfg_base.topk_list)
-            print_method_breakdown('RECERASER', rec_stats)
+            print(f'RecEraser : {rec_time:.4f}s')
 
-        if method_mode in ['retrain', 'all']:
-            csv_rows.append(metrics_to_row(run_id, unlearn_type, target, 'Retrain', retrain_time, retrain_stats, retrain_metrics, cfg_base.topk_list))
-        if method_mode in ['sisa', 'all']:
-            csv_rows.append(metrics_to_row(run_id, unlearn_type, target, 'SISA', sisa_time, sisa_stats, sisa_metrics, cfg_base.topk_list))
-        if method_mode in ['receraser', 'all']:
-            csv_rows.append(metrics_to_row(run_id, unlearn_type, target, 'RecEraser', rec_time, rec_stats, rec_metrics, cfg_base.topk_list))
+    saved_files = []
 
-    csv_path = build_csv_path(cfg_base)
-    write_csv(csv_path, csv_rows, cfg_base.topk_list)
-    print(f'\n[CSV SAVED] {csv_path}')
-    print_average_summary(csv_rows, cfg_base.topk_list)
+    if len(method_rows['Retrain']) > 0:
+        p2 = build_csv_path_for_method(cfg_retrain, 'retrain', partition_type='full_retrain')
+        write_csv(p2, method_rows['Retrain'], cfg_base.topk_list)
+        saved_files.append(p2)
+
+    if len(method_rows['SISA']) > 0:
+        p2 = build_csv_path_for_method(cfg_sisa, 'sisa', partition_type=getattr(cfg_sisa, 'partition_type', 'interaction_based'))
+        write_csv(p2, method_rows['SISA'], cfg_base.topk_list)
+        saved_files.append(p2)
+
+    if len(method_rows['RecEraser']) > 0:
+        p2 = build_csv_path_for_method(cfg_rec, 'receraser', partition_type=getattr(cfg_rec, 'partition_type', 'user_based'))
+        write_csv(p2, method_rows['RecEraser'], cfg_base.topk_list)
+        saved_files.append(p2)
+
+    print('\n[CSV SAVED FILES]')
+    for p2 in saved_files:
+        print(p2)
+
+    all_rows = method_rows['Retrain'] + method_rows['SISA'] + method_rows['RecEraser']
+    print_average_summary(all_rows, cfg_base.topk_list)
 
 if __name__ == '__main__':
     main()

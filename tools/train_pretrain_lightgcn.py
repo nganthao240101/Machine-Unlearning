@@ -17,12 +17,12 @@ tf.disable_v2_behavior()
 def parse_args():
     parser = argparse.ArgumentParser(description="Train LightGCN pretrain embeddings for RecEraser")
 
-    parser.add_argument("--dataset", type=str, default="ml-1m",
+    parser.add_argument("--dataset", type=str, default="ml-10m",
                         help="Dataset name: ml-1m | ml-10m | yelp2018")
     parser.add_argument("--data_dir", type=str, default="data",
                         help="Root data directory")
 
-    parser.add_argument("--epochs", type=int, default=100,
+    parser.add_argument("--epochs", type=int, default=10,
                         help="Training epochs")
     parser.add_argument("--embed_size", type=int, default=64,
                         help="Embedding size")
@@ -32,14 +32,12 @@ def parse_args():
                         help="Learning rate")
     parser.add_argument("--reg", type=float, default=1e-3,
                         help="L2 regularization")
-    parser.add_argument("--gcn_layers", type=int, default=2,
+    parser.add_argument("--gcn_layers", type=int, default=3,
                         help="Number of LightGCN layers")
-    parser.add_argument("--eval_every", type=int, default=5,
-                        help="Evaluate every N epochs")
     parser.add_argument("--seed", type=int, default=2024,
                         help="Random seed")
     parser.add_argument("--topk", type=str, default="10,20,50",
-                        help="Top-K list, e.g. 10,20,50")
+                        help="Kept only for compatibility; not used in this fast pretrain script")
 
     return parser.parse_args()
 
@@ -154,9 +152,10 @@ class LightGCNData:
             pos_i = random.choice(pos_list)
             pos_items.append(pos_i)
 
+            user_pos_set = set(self.train_user_dict[u])
             while True:
                 neg_i = random.randint(0, self.n_items - 1)
-                if neg_i not in self.train_user_dict[u]:
+                if neg_i not in user_pos_set:
                     neg_items.append(neg_i)
                     break
 
@@ -205,11 +204,6 @@ class LightGCN:
         self.u_g_embeddings_pre = tf.nn.embedding_lookup(self.user_embedding, self.users)
         self.pos_i_g_embeddings_pre = tf.nn.embedding_lookup(self.item_embedding, self.pos_items)
         self.neg_i_g_embeddings_pre = tf.nn.embedding_lookup(self.item_embedding, self.neg_items)
-
-        self.batch_ratings = tf.matmul(
-            self.u_g_embeddings, self.pos_i_g_embeddings,
-            transpose_a=False, transpose_b=True
-        )
 
         self.mf_loss, self.emb_loss, self.reg_loss = self.create_bpr_loss(
             self.u_g_embeddings, self.pos_i_g_embeddings, self.neg_i_g_embeddings
@@ -277,74 +271,6 @@ class LightGCN:
 
 
 # =========================================================
-# EVAL
-# =========================================================
-def evaluate_model(sess, model, data, topk_list):
-    recalls = [0.0 for _ in topk_list]
-    precisions = [0.0 for _ in topk_list]
-    ndcgs = [0.0 for _ in topk_list]
-
-    test_users = [u for u in data.test_user_dict.keys() if len(data.test_user_dict[u]) > 0]
-    n_eval = 0
-
-    for u in test_users:
-        gt_items = data.test_user_dict[u]
-        if len(gt_items) == 0:
-            continue
-
-        user_arr = np.full(shape=(data.n_items,), fill_value=u, dtype=np.int32)
-        item_arr = np.arange(data.n_items, dtype=np.int32)
-        dummy_neg = np.zeros(data.n_items, dtype=np.int32)
-
-        scores = sess.run(
-            model.batch_ratings,
-            feed_dict={
-                model.users: user_arr,
-                model.pos_items: item_arr,
-                model.neg_items: dummy_neg,
-            }
-        )
-        scores = np.diag(scores)
-
-        for seen_i in data.train_user_dict.get(u, []):
-            scores[seen_i] = -1e12
-
-        ranking = np.argsort(-scores)
-
-        for idx, k in enumerate(topk_list):
-            topk_items = ranking[:k]
-            hits = [1 if i in gt_items else 0 for i in topk_items]
-
-            hit_count = sum(hits)
-            recalls[idx] += hit_count / max(len(gt_items), 1)
-            precisions[idx] += hit_count / k
-
-            dcg = 0.0
-            for rank, item in enumerate(topk_items):
-                if item in gt_items:
-                    dcg += 1.0 / np.log2(rank + 2)
-
-            ideal_hits = min(len(gt_items), k)
-            idcg = sum(1.0 / np.log2(rank + 2) for rank in range(ideal_hits))
-            ndcgs[idx] += (dcg / idcg) if idcg > 0 else 0.0
-
-        n_eval += 1
-
-    if n_eval == 0:
-        return {
-            "recall": [0.0 for _ in topk_list],
-            "precision": [0.0 for _ in topk_list],
-            "ndcg": [0.0 for _ in topk_list],
-        }
-
-    return {
-        "recall": [x / n_eval for x in recalls],
-        "precision": [x / n_eval for x in precisions],
-        "ndcg": [x / n_eval for x in ndcgs],
-    }
-
-
-# =========================================================
 # MAIN
 # =========================================================
 def main():
@@ -358,7 +284,10 @@ def main():
     train_path = os.path.join(dataset_dir, "train.txt")
     test_path = os.path.join(dataset_dir, "test.txt")
 
-    topk_list = [int(x) for x in args.topk.split(",")]
+    if not os.path.exists(train_path):
+        raise FileNotFoundError(f"train.txt not found: {train_path}")
+    if not os.path.exists(test_path):
+        raise FileNotFoundError(f"test.txt not found: {test_path}")
 
     data = LightGCNData(train_path, test_path, seed=args.seed)
 
@@ -390,7 +319,6 @@ def main():
         print(f"  lr          : {args.lr}")
         print(f"  reg         : {args.reg}")
         print(f"  gcn_layers  : {args.gcn_layers}")
-        print(f"  topk        : {topk_list}")
 
         for epoch in range(args.epochs):
             t1 = time.time()
@@ -415,32 +343,22 @@ def main():
             if np.isnan(loss):
                 raise ValueError("loss is nan")
 
-            if (epoch + 1) % args.eval_every != 0:
-                print(
-                    f"Epoch {epoch+1:03d} [{time.time()-t1:.1f}s] "
-                    f"train==[{loss:.5f}={mf_loss:.5f}+{emb_loss:.5f}]"
-                )
-                continue
-
-            t2 = time.time()
-            ret = evaluate_model(sess, model, data, topk_list)
-            t3 = time.time()
-
             print(
-                f"Epoch {epoch+1:03d} [{t2-t1:.1f}s + {t3-t2:.1f}s] "
-                f"train==[{loss:.5f}={mf_loss:.5f}+{emb_loss:.5f}] "
-                f"recall={ret['recall']} precision={ret['precision']} ndcg={ret['ndcg']}"
+                f"Epoch {epoch+1:03d} [{time.time()-t1:.1f}s] "
+                f"train==[{loss:.5f}={mf_loss:.5f}+{emb_loss:.5f}], "
+                f"steps={n_batch}, interactions={data.n_train}"
             )
 
         print(f"\n[TRAIN DONE] total_time={time.time()-t0:.1f}s")
 
+        # save embeddings
         user_emb, item_emb = sess.run([model.user_embedding, model.item_embedding])
 
         user_dict = {int(i): user_emb[i] for i in range(user_emb.shape[0])}
         item_dict = {int(i): item_emb[i] for i in range(item_emb.shape[0])}
 
-        user_path = os.path.join(dataset_dir, "user_pretrain.pk")
-        item_path = os.path.join(dataset_dir, "item_pretrain.pk")
+        user_path = os.path.join(dataset_dir, "user_pretrain_lightgcn.pk")
+        item_path = os.path.join(dataset_dir, "item_pretrain_lightgcn.pk")
 
         with open(user_path, "wb") as f:
             pkl.dump(user_dict, f, protocol=pkl.HIGHEST_PROTOCOL)
@@ -450,7 +368,7 @@ def main():
 
         print(f"[SAVE] {user_path}")
         print(f"[SAVE] {item_path}")
-        print("Saved user_pretrain.pk & item_pretrain.pk")
+        print("Saved user_pretrain_lightgcn.pk & item_pretrain_lightgcn.pk")
 
 
 if __name__ == "__main__":

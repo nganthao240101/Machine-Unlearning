@@ -36,6 +36,9 @@ def load_state(path):
 
 # =========================================================
 # STATE AGGREGATION
+# NOTE:
+# - average_states is suitable for methods that really need model/state averaging
+# - DO NOT use this for RecEraser aggregation
 # =========================================================
 def average_states(states):
     """
@@ -218,10 +221,10 @@ def load_pretrain_embeddings(load_dir):
         return None, None
 
     with open(user_path, "rb") as f:
-        user_dict = pickle.load(f)
+        user_dict = pkl.load(f)
 
     with open(item_path, "rb") as f:
-        item_dict = pickle.load(f)
+        item_dict = pkl.load(f)
 
     print("[LOAD] user_pretrain <-", user_path)
     print("[LOAD] item_pretrain <-", item_path)

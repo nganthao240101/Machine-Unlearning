@@ -1,27 +1,21 @@
-
 import os
 import random
 import numpy as np
 import tensorflow.compat.v1 as tf
 
 tf.disable_v2_behavior()
-
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 
 class RecEraserBPRTF:
     """
-    TensorFlow 1.x implementation of RecEraser-BPR with:
-    - local shard-specific BPR training
-    - trainable aggregation module (transform + attention)
-    - prediction on aggregated user/item embeddings
-
-    Main fixes compared with many rough drafts:
-    1) local optimization updates only the corresponding shard slice
-    2) aggregation optimization updates only aggregation parameters
-    3) local loss and agg loss are separated clearly
-    4) prediction uses the same aggregation path as training
-    5) helper methods added for loading local embeddings and cached states
+    RecEraser-BPR:
+    - local train: update shard-specific user/item embeddings
+    - agg train: freeze local embeddings with stop_gradient
+    - agg updates ONLY:
+        trans_W, trans_B,
+        WA, BA, HA,
+        WB, BB, HB
     """
 
     def __init__(self, cfg, n_users, n_items):
@@ -29,7 +23,7 @@ class RecEraserBPRTF:
         self.n_users = int(n_users)
         self.n_items = int(n_items)
 
-        self.lr = float(getattr(cfg, "lr", 0.05))
+        self.lr = float(getattr(cfg, "lr", 0.01))
         self.emb_dim = int(getattr(cfg, "emb_dim", 64))
         self.attention_size = max(1, self.emb_dim // 2)
         self.batch_size = int(getattr(cfg, "batch_size", 512))
@@ -53,7 +47,6 @@ class RecEraserBPRTF:
 
             self.weights = self._init_weights()
 
-            # local train ops / losses
             self.opt_local = []
             self.loss_local = []
             self.mf_loss_local = []
@@ -87,30 +80,25 @@ class RecEraserBPRTF:
         self.sess.run(self.init_op)
 
     # =========================================================
-    # GRAPH / WEIGHTS
+    # INIT
     # =========================================================
     def _init_weights(self):
-        initializer = tf.glorot_uniform_initializer(seed=self.seed)
         all_weights = {}
+        initializer = tf.glorot_uniform_initializer(seed=self.seed)
 
-        # Keep local embeddings as separate variables to make shard updates precise.
-        all_weights["user_embedding_list"] = [
-            tf.Variable(
-                initializer([self.n_users, self.emb_dim]),
-                name=f"user_embedding_{i}"
-            )
-            for i in range(self.num_local)
-        ]
-        all_weights["item_embedding_list"] = [
-            tf.Variable(
-                initializer([self.n_items, self.emb_dim]),
-                name=f"item_embedding_{i}"
-            )
-            for i in range(self.num_local)
-        ]
+        # [n_users, num_local, emb_dim], [n_items, num_local, emb_dim]
+        all_weights["user_embedding"] = tf.Variable(
+            initializer([self.n_users, self.num_local, self.emb_dim]),
+            name="user_embedding",
+        )
+        all_weights["item_embedding"] = tf.Variable(
+            initializer([self.n_items, self.num_local, self.emb_dim]),
+            name="item_embedding",
+        )
 
         stddev = np.sqrt(2.0 / float(self.attention_size + self.emb_dim))
 
+        # user attention
         all_weights["WA"] = tf.Variable(
             tf.random.truncated_normal(
                 shape=[self.emb_dim, self.attention_size],
@@ -130,6 +118,7 @@ class RecEraserBPRTF:
             name="HA",
         )
 
+        # item attention
         all_weights["WB"] = tf.Variable(
             tf.random.truncated_normal(
                 shape=[self.emb_dim, self.attention_size],
@@ -149,6 +138,7 @@ class RecEraserBPRTF:
             name="HB",
         )
 
+        # transform
         all_weights["trans_W"] = tf.Variable(
             initializer([self.num_local, self.emb_dim, self.emb_dim]),
             name="trans_W",
@@ -157,14 +147,12 @@ class RecEraserBPRTF:
             initializer([self.num_local, self.emb_dim]),
             name="trans_B",
         )
+
         return all_weights
 
-    def _stack_user_embeddings(self):
-        return tf.stack(self.weights["user_embedding_list"], axis=1)
-
-    def _stack_item_embeddings(self):
-        return tf.stack(self.weights["item_embedding_list"], axis=1)
-
+    # =========================================================
+    # LOSS
+    # =========================================================
     def create_bpr_loss(self, users, pos_items, neg_items):
         pos_scores = tf.reduce_sum(users * pos_items, axis=1)
         neg_scores = tf.reduce_sum(users * neg_items, axis=1)
@@ -177,17 +165,16 @@ class RecEraserBPRTF:
         batch_den = tf.cast(tf.maximum(tf.shape(users)[0], 1), tf.float32)
         regularizer = regularizer / batch_den
 
-        # numerically safer than log(sigmoid(x))
-        mf_loss = tf.reduce_mean(tf.nn.softplus(-(pos_scores - neg_scores)))
+        mf_loss = -tf.reduce_mean(tf.log(tf.nn.sigmoid(pos_scores - neg_scores) + 1e-8))
         reg_loss = self.decay * regularizer
         return mf_loss, reg_loss
 
     # =========================================================
-    # LOCAL MODEL
+    # LOCAL TRAIN
     # =========================================================
     def _build_local_train_graph(self, local_num):
-        user_var = self.weights["user_embedding_list"][local_num]
-        item_var = self.weights["item_embedding_list"][local_num]
+        user_var = self.weights["user_embedding"][:, local_num, :]
+        item_var = self.weights["item_embedding"][:, local_num, :]
 
         u_e = tf.nn.embedding_lookup(user_var, self.users)
         pos_i_e = tf.nn.embedding_lookup(item_var, self.pos_items)
@@ -196,53 +183,75 @@ class RecEraserBPRTF:
         mf_loss, reg_loss = self.create_bpr_loss(u_e, pos_i_e, neg_i_e)
         loss = mf_loss + reg_loss
 
-        optimizer = tf.train.AdagradOptimizer(
+        opt = tf.train.AdagradOptimizer(
             learning_rate=self.lr,
             initial_accumulator_value=1e-8,
-        )
-        opt = optimizer.minimize(loss, var_list=[user_var, item_var])
+        ).minimize(loss)
 
         return opt, loss, mf_loss, reg_loss
 
     # =========================================================
-    # ATTENTION AGG
+    # AGG HELPERS
     # =========================================================
+    # def attention_based_agg(self, embs, flag):
+    #     if flag == 0:
+    #         hidden = tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WA"]) + self.weights["BA"])
+    #         embs_w = tf.exp(tf.einsum("abk,kl->abl", hidden, self.weights["HA"]))
+    #     else:
+    #         hidden = tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WB"]) + self.weights["BB"])
+    #         embs_w = tf.exp(tf.einsum("abk,kl->abl", hidden, self.weights["HB"]))
+
+    #     embs_w = embs_w / tf.reduce_sum(embs_w, axis=1, keepdims=True)
+    #     agg_emb = tf.reduce_sum(embs_w * embs, axis=1)
+    #     return agg_emb, embs_w
     def attention_based_agg(self, embs, flag):
         if flag == 0:
-            hidden = tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WA"]) + self.weights["BA"])
-            logits = tf.einsum("abk,kl->abl", hidden, self.weights["HA"])
+            hidden = tf.nn.relu(
+                tf.einsum('abc,ck->abk', embs, self.weights['WA']) + self.weights['BA']
+            )
+            scores = tf.einsum('abk,kl->abl', hidden, self.weights['HA'])
         else:
-            hidden = tf.nn.relu(tf.einsum("abc,ck->abk", embs, self.weights["WB"]) + self.weights["BB"])
-            logits = tf.einsum("abk,kl->abl", hidden, self.weights["HB"])
+            hidden = tf.nn.relu(
+                tf.einsum('abc,ck->abk', embs, self.weights['WB']) + self.weights['BB']
+            )
+            scores = tf.einsum('abk,kl->abl', hidden, self.weights['HB'])
 
-        weights = tf.nn.softmax(logits, axis=1)
-        agg_emb = tf.reduce_sum(weights * embs, axis=1)
-        return agg_emb, weights
+        # 🔥 FIX NAN (CỰC KỲ QUAN TRỌNG)
+        scores = scores - tf.reduce_max(scores, axis=1, keepdims=True)
+        embs_w = tf.nn.softmax(scores, axis=1)
 
+        agg_emb = tf.reduce_sum(embs_w * embs, axis=1)
+        return agg_emb, embs_w
     def _transform_local_embs(self, embs):
-        # embs: [batch_or_items, num_local, emb_dim]
         return tf.einsum("abc,bcd->abd", embs, self.weights["trans_W"]) + self.weights["trans_B"]
 
+    # =========================================================
+    # AGG TRAIN
+    # =========================================================
     def _build_agg_train_graph(self):
-        user_embs = self._stack_user_embeddings()
-        item_embs = self._stack_item_embeddings()
+        # Freeze local embeddings in aggregation phase
+        u_es = tf.stop_gradient(tf.nn.embedding_lookup(self.weights["user_embedding"], self.users))
+        pos_i_es = tf.stop_gradient(tf.nn.embedding_lookup(self.weights["item_embedding"], self.pos_items))
+        neg_i_es = tf.stop_gradient(tf.nn.embedding_lookup(self.weights["item_embedding"], self.neg_items))
 
-        # freeze local embeddings during agg training
-        u_es = tf.stop_gradient(tf.nn.embedding_lookup(user_embs, self.users))
-        pos_i_es = tf.stop_gradient(tf.nn.embedding_lookup(item_embs, self.pos_items))
-        neg_i_es = tf.stop_gradient(tf.nn.embedding_lookup(item_embs, self.neg_items))
-
+        # Only transform + attention remain trainable
         u_es = self._transform_local_embs(u_es)
         pos_i_es = self._transform_local_embs(pos_i_es)
         neg_i_es = self._transform_local_embs(neg_i_es)
 
-        u_e, u_w = self.attention_based_agg(u_es, flag=0)
-        pos_i_e, _ = self.attention_based_agg(pos_i_es, flag=1)
-        neg_i_e, _ = self.attention_based_agg(neg_i_es, flag=1)
+        u_e, u_w = self.attention_based_agg(u_es, 0)
+        pos_i_e, _ = self.attention_based_agg(pos_i_es, 1)
+        neg_i_e, _ = self.attention_based_agg(neg_i_es, 1)
 
         u_e_drop = tf.nn.dropout(u_e, keep_prob=self.dropout_keep_prob)
 
-        mf_loss, reg_loss_bpr = self.create_bpr_loss(u_e_drop, pos_i_e, neg_i_e)
+        mf_loss, _ = self.create_bpr_loss(u_e_drop, pos_i_e, neg_i_e)
+
+        # keep agg optimization light, close to sample code
+        trans_reg = 1e-5 * (
+            tf.nn.l2_loss(self.weights["trans_W"]) +
+            tf.nn.l2_loss(self.weights["trans_B"])
+        )
 
         attention_reg = self.decay * (
             tf.nn.l2_loss(self.weights["WA"]) +
@@ -253,42 +262,33 @@ class RecEraserBPRTF:
             tf.nn.l2_loss(self.weights["HB"])
         )
 
-        trans_reg = 1e-5 * (
-            tf.nn.l2_loss(self.weights["trans_W"]) +
-            tf.nn.l2_loss(self.weights["trans_B"])
-        )
-
-        total_reg = reg_loss_bpr + attention_reg + trans_reg
-        loss = mf_loss + total_reg
-
+        loss = mf_loss + trans_reg
         train_scores = tf.reduce_sum(u_e * pos_i_e, axis=1)
 
+        # IMPORTANT: agg only updates transform + attention vars
         agg_vars = [
             self.weights["WA"], self.weights["BA"], self.weights["HA"],
             self.weights["WB"], self.weights["BB"], self.weights["HB"],
             self.weights["trans_W"], self.weights["trans_B"],
         ]
-        optimizer = tf.train.AdagradOptimizer(
+
+        opt = tf.train.AdagradOptimizer(
             learning_rate=self.lr,
             initial_accumulator_value=1e-8,
-        )
-        opt = optimizer.minimize(loss, var_list=agg_vars)
+        ).minimize(loss, var_list=agg_vars)
 
-        return opt, loss, mf_loss, total_reg, attention_reg, train_scores, u_w
+        return opt, loss, mf_loss, trans_reg, attention_reg, train_scores, u_w
 
     # =========================================================
-    # PREDICTION
+    # PREDICT
     # =========================================================
     def _build_prediction_graph(self):
-        user_embs = self._stack_user_embeddings()
-        item_embs = self._stack_item_embeddings()
-
-        pred_user_local = tf.nn.embedding_lookup(user_embs, self.pred_users)
+        pred_user_local = tf.nn.embedding_lookup(self.weights["user_embedding"], self.pred_users)
         pred_user_local = self._transform_local_embs(pred_user_local)
-        pred_user_agg, _ = self.attention_based_agg(pred_user_local, flag=0)
+        pred_user_agg, _ = self.attention_based_agg(pred_user_local, 0)
 
-        all_item_local = self._transform_local_embs(item_embs)
-        all_item_agg, _ = self.attention_based_agg(all_item_local, flag=1)
+        all_item_local = self._transform_local_embs(self.weights["item_embedding"])
+        all_item_agg, _ = self.attention_based_agg(all_item_local, 1)
 
         scores = tf.matmul(pred_user_agg, all_item_agg, transpose_b=True)
         return scores
@@ -317,9 +317,9 @@ class RecEraserBPRTF:
                     self.users: np.asarray(users, dtype=np.int32),
                     self.pos_items: np.asarray(pos_items, dtype=np.int32),
                     self.neg_items: np.asarray(neg_items, dtype=np.int32),
-                    self.dropout_keep_prob: self.keep_prob,
                 },
             )
+
             loss += batch_loss
             mf_loss += batch_mf_loss
             reg_loss += batch_reg_loss
@@ -328,11 +328,21 @@ class RecEraserBPRTF:
         if eff_batch == 0:
             return 0.0, 0.0, 0.0
 
-        return float(loss / eff_batch), float(mf_loss / eff_batch), float(reg_loss / eff_batch)
+        return (
+            float(loss / eff_batch),
+            float(mf_loss / eff_batch),
+            float(reg_loss / eff_batch),
+        )
 
     def fit_agg_epoch(self, loader):
-        n_batch = max(1, int(loader.n_train) // self.batch_size + 1)
-        loss = mf_loss = reg_loss = att_loss = 0.0
+        # For exact sample spirit, use full remaining data each epoch
+        sample_ratio = float(getattr(self.cfg, "agg_sample_ratio", 1.0))
+        sample_ratio = max(0.05, min(1.0, sample_ratio))
+
+        full_batches = max(1, int(loader.n_train) // self.batch_size + 1)
+        n_batch = max(1, int(np.ceil(full_batches * sample_ratio)))
+
+        loss = mf_loss = reg_loss = attention_loss = 0.0
         eff_batch = 0
 
         for _ in range(n_batch):
@@ -355,10 +365,11 @@ class RecEraserBPRTF:
                     self.dropout_keep_prob: self.keep_prob,
                 },
             )
+
             loss += batch_loss
             mf_loss += batch_mf_loss
             reg_loss += batch_reg_loss
-            att_loss += batch_attention_loss
+            attention_loss += batch_attention_loss
             eff_batch += 1
 
         if eff_batch == 0:
@@ -368,15 +379,13 @@ class RecEraserBPRTF:
             float(loss / eff_batch),
             float(mf_loss / eff_batch),
             float(reg_loss / eff_batch),
-            float(att_loss / eff_batch),
+            float(attention_loss / eff_batch),
         )
 
     def predict(self, user_id):
         scores = self.sess.run(
             self.pred_scores,
-            feed_dict={
-                self.pred_users: np.asarray([int(user_id)], dtype=np.int32),
-            },
+            feed_dict={self.pred_users: np.asarray([int(user_id)], dtype=np.int32)},
         )
         return scores[0]
 
@@ -396,32 +405,6 @@ class RecEraserBPRTF:
             for var in tf.global_variables():
                 if var.name in state:
                     assigns.append(tf.assign(var, state[var.name]))
-            if assigns:
-                self.sess.run(assigns)
-
-    def export_local_embeddings(self):
-        """
-        Return local shard embeddings for cache/checkpoint usage.
-        """
-        user_vals = self.sess.run(self.weights["user_embedding_list"])
-        item_vals = self.sess.run(self.weights["item_embedding_list"])
-        return {
-            "user_embedding_list": user_vals,
-            "item_embedding_list": item_vals,
-        }
-
-    def load_local_embeddings(self, state):
-        """
-        Load only local shard embeddings, useful after retraining affected shards.
-        """
-        with self.graph.as_default():
-            assigns = []
-            if "user_embedding_list" in state:
-                for var, val in zip(self.weights["user_embedding_list"], state["user_embedding_list"]):
-                    assigns.append(tf.assign(var, val))
-            if "item_embedding_list" in state:
-                for var, val in zip(self.weights["item_embedding_list"], state["item_embedding_list"]):
-                    assigns.append(tf.assign(var, val))
             if assigns:
                 self.sess.run(assigns)
 
@@ -453,12 +436,15 @@ class RecEraserBPRWrapper:
                 "reg_loss": reg_loss,
                 "local_id": local_id,
                 "epoch": epoch + 1,
+                "local_users": len(loader.C_U[local_id]) if getattr(loader, "C_U", None) is not None else None,
+                "local_interactions": loader.n_C[local_id] if getattr(loader, "n_C", None) is not None else None,
             }
 
             if getattr(self.cfg, "print_loss", False):
                 print(
                     f"[REC LOCAL][shard={local_id}][Epoch {epoch+1}/{epochs}] "
-                    f"loss={loss:.6f}, mf={mf_loss:.6f}, reg={reg_loss:.6f}"
+                    f"loss={loss:.6f}, mf={mf_loss:.6f}, reg={reg_loss:.6f}, "
+                    f"users={last_stats['local_users']}, interactions={last_stats['local_interactions']}"
                 )
 
         return last_stats
@@ -470,6 +456,11 @@ class RecEraserBPRWrapper:
         epochs = max(1, int(epochs))
         last_stats = None
 
+        print(
+            f"[REC AGG] global_users={len(loader.exist_users)}, "
+            f"global_interactions={loader.n_train}"
+        )
+
         for epoch in range(epochs):
             loss, mf_loss, reg_loss, attention_loss = self.model.fit_agg_epoch(loader)
             last_stats = {
@@ -478,13 +469,17 @@ class RecEraserBPRWrapper:
                 "reg_loss": reg_loss,
                 "attention_loss": attention_loss,
                 "epoch": epoch + 1,
+                "global_users": len(loader.exist_users),
+                "global_interactions": loader.n_train,
             }
 
             if getattr(self.cfg, "print_loss", False):
                 print(
                     f"[REC AGG][Epoch {epoch+1}/{epochs}] "
                     f"loss={loss:.6f}, mf={mf_loss:.6f}, reg={reg_loss:.6f}, "
-                    f"attention={attention_loss:.6f}"
+                    f"attention={attention_loss:.6f}, "
+                    f"global_users={len(loader.exist_users)}, "
+                    f"global_interactions={loader.n_train}"
                 )
 
         return last_stats
@@ -500,12 +495,6 @@ class RecEraserBPRWrapper:
 
     def set_state(self, state):
         self.model.set_state(state)
-
-    def export_local_embeddings(self):
-        return self.model.export_local_embeddings()
-
-    def load_local_embeddings(self, state):
-        self.model.load_local_embeddings(state)
 
     def clone_fresh(self):
         return RecEraserBPRWrapper(self.cfg, self.n_users, self.n_items)

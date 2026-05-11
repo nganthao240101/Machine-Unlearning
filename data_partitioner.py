@@ -1,10 +1,9 @@
 import os
 import pickle
 import random
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
-
 
 UserDict = Dict[int, List[int]]
 ShardList = List[UserDict]
@@ -16,6 +15,17 @@ class DataPartitioner:
         - interaction_based
         - user_based
         - item_based
+
+    Auto cache invalidation:
+    - dataset_name
+    - model_type
+    - emb_dim
+    - partition_type
+    - shard_num
+    - seed
+    - partition hyperparameters
+    - pretrain file paths
+    - pretrain file modified times
     """
 
     def __init__(self, cfg):
@@ -47,6 +57,120 @@ class DataPartitioner:
 
         random.seed(self.seed)
         np.random.seed(self.seed)
+
+    # =========================================================
+    # CACHE
+    # =========================================================
+    def _get_cache_dir(self):
+        cache_dir = getattr(self.cfg, "partition_cache_dir", "cache/partition")
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+    def _get_cache_path(self):
+        dataset = getattr(self.cfg, "dataset_name", "data")
+        model = getattr(self.cfg, "model_type", "model")
+        method = getattr(
+            self.cfg,
+            "method",
+            getattr(self.cfg, "method_type", "method")
+        )
+        mode = self.partition_type
+        shard_num = int(getattr(self.cfg, "shard_num", 5))
+        seed = int(getattr(self.cfg, "seed", 2024))
+        emb_dim = int(getattr(self.cfg, "emb_dim", 64))
+
+        fname = (
+            f"{dataset}"
+            f"__{model}"
+            f"__{method}"
+            f"__{mode}"
+            f"__shard{shard_num}"
+            f"__dim{emb_dim}"
+            f"__seed{seed}.pkl"
+        )
+
+        return os.path.join(self._get_cache_dir(), fname)
+
+    def _safe_mtime(self, path):
+        if path and os.path.exists(path):
+            return os.path.getmtime(path)
+        return None
+
+    def _build_cache_meta(self):
+        return {
+            "dataset_name": getattr(self.cfg, "dataset_name", None),
+            "model_type": getattr(self.cfg, "model_type", None),
+            "emb_dim": int(getattr(self.cfg, "emb_dim", -1)),
+            "partition_type": self.partition_type,
+            "shard_num": int(self.shard_num),
+            "seed": int(self.seed),
+            "interaction_partition_iters": int(self.interaction_partition_iters),
+            "interaction_capacity_ratio": float(self.interaction_capacity_ratio),
+            "user_partition_iters": int(self.user_partition_iters),
+            "user_capacity_ratio": float(self.user_capacity_ratio),
+            "item_partition_iters": int(self.item_partition_iters),
+            "item_capacity_ratio": float(self.item_capacity_ratio),
+            "user_pretrain_path": os.path.abspath(self.user_pretrain_path) if self.user_pretrain_path else None,
+            "item_pretrain_path": os.path.abspath(self.item_pretrain_path) if self.item_pretrain_path else None,
+            "user_pretrain_mtime": self._safe_mtime(self.user_pretrain_path),
+            "item_pretrain_mtime": self._safe_mtime(self.item_pretrain_path),
+        }
+
+    def _is_cache_valid(self, cached_meta):
+        current_meta = self._build_cache_meta()
+        return cached_meta == current_meta
+
+    def _load_cache(self):
+        if not getattr(self.cfg, "use_partition_cache", False):
+            return None
+
+        path = self._get_cache_path()
+        if not os.path.exists(path):
+            print("[Partition] Cache not found -> building new partition")
+            return None
+
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+        except Exception as e:
+            print(f"[Partition] Cache corrupted -> rebuilding ({e})")
+            return None
+
+        if not isinstance(data, dict):
+            print("[Partition] Invalid cache format -> rebuilding")
+            return None
+
+        cached_meta = data.get("meta", None)
+        if cached_meta is None:
+            print("[Partition] Old cache format -> rebuilding")
+            return None
+
+        if not self._is_cache_valid(cached_meta):
+            print("[Partition] Cache mismatch with current config/pretrain -> rebuilding")
+            return None
+
+        if "clusters" not in data or "users" not in data or "items" not in data:
+            print("[Partition] Missing cache fields -> rebuilding")
+            return None
+
+        print(f"[Partition] Loaded from cache: {path}")
+        return data
+
+    def _save_cache(self, clusters, users, items):
+        if not getattr(self.cfg, "use_partition_cache", False):
+            return
+
+        path = self._get_cache_path()
+        data = {
+            "meta": self._build_cache_meta(),
+            "clusters": clusters,
+            "users": users,
+            "items": items,
+        }
+
+        with open(path, "wb") as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        print(f"[Partition] Saved to cache: {path}")
 
     # =========================================================
     # helpers
@@ -444,13 +568,22 @@ class DataPartitioner:
     # main
     # =========================================================
     def partition(self, user_dict: UserDict):
-        if self.partition_type == "interaction_based":
-            return self.interaction_based_partition(user_dict)
-        if self.partition_type == "user_based":
-            return self.user_based_partition(user_dict)
-        if self.partition_type == "item_based":
-            return self.item_based_partition(user_dict)
+        cached = self._load_cache()
+        if cached is not None:
+            return cached["clusters"], cached["users"], cached["items"]
 
-        raise ValueError(
-            "partition_type must be one of: interaction_based, user_based, item_based"
-        )
+        print(f"[Partition] mode = {self.partition_type}")
+
+        if self.partition_type == "interaction_based":
+            clusters, users, items = self.interaction_based_partition(user_dict)
+        elif self.partition_type == "user_based":
+            clusters, users, items = self.user_based_partition(user_dict)
+        elif self.partition_type == "item_based":
+            clusters, users, items = self.item_based_partition(user_dict)
+        else:
+            raise ValueError(
+                "partition_type must be one of: interaction_based, user_based, item_based"
+            )
+
+        self._save_cache(clusters, users, items)
+        return clusters, users, items
